@@ -734,3 +734,27 @@ func (p *AppPlayer) Run(ctx context.Context, apiRecv <-chan ApiRequest, mprisRec
 		}
 	}
 }
+
+func (p *AppPlayer) ApiPlay() error {
+	_, err := p.handleApiRequest(context.Background(), ApiRequest{Type: ApiRequestTypeResume})
+	return err
+}
+
+func (p *AppPlayer) ApiPause() error {
+	_, err := p.handleApiRequest(context.Background(), ApiRequest{Type: ApiRequestTypePause})
+	return err
+}
+
+func (p *AppPlayer) ApiNext(uri string) error {
+	u := uri
+	_, err := p.handleApiRequest(context.Background(), ApiRequest{
+		Type: ApiRequestTypeNext,
+		Data: &ApiRequestDataNext{Uri: &u},
+	})
+	return err
+}
+
+func (p *AppPlayer) ApiPrev() error {
+	_, err := p.handleApiRequest(context.Background(), ApiRequest{Type: ApiRequestTypePrev})
+	return err
+}

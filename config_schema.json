@@ -68,11 +68,7 @@
         "audio_backend": {
           "type": "string",
           "description": "Which audio backend (API) should be used for playback, leave empty for default",
-          "enum": [
-            "alsa",
-            "pulseaudio",
-            "pipe"
-          ],
+          "enum": ["alsa", "pulseaudio", "pipe", "oto"],
           "default": "alsa"
         },
         "audio_device": {
@@ -108,11 +104,7 @@
         "audio_output_pipe_format": {
           "type": "string",
           "description": "The format of the audio data written to the pipe",
-          "enum": [
-            "s16le",
-            "s32le",
-            "f32le"
-          ],
+          "enum": ["s16le", "s32le", "f32le"],
           "default": "s16le"
         },
         "server": {
@@ -151,12 +143,7 @@
             "image_size": {
               "type": "string",
               "description": "The preferred size of album cover images served by the API server",
-              "enum": [
-                "default",
-                "small",
-                "large",
-                "xlarge"
-              ]
+              "enum": ["default", "small", "large", "xlarge"]
             }
           }
         },
@@ -173,10 +160,7 @@
         "zeroconf_backend": {
           "type": "string",
           "description": "The mDNS backend to use for Zeroconf service registration. 'builtin' uses the built-in mDNS responder, 'avahi' uses an existing avahi-daemon via D-Bus",
-          "enum": [
-            "builtin",
-            "avahi"
-          ],
+          "enum": ["builtin", "avahi"],
           "default": "builtin"
         },
         "zeroconf_interfaces_to_advertise": {
@@ -190,11 +174,7 @@
             "type": {
               "type": "string",
               "description": "The authentication method",
-              "enum": [
-                "interactive",
-                "spotify_token",
-                "zeroconf"
-              ],
+              "enum": ["interactive", "spotify_token", "zeroconf"],
               "default": "zeroconf"
             },
             "interactive": {
@@ -237,11 +217,7 @@
         "bitrate": {
           "type": "integer",
           "description": "The preferred bitrate for audio playback, default is 160kbps",
-          "enum": [
-            96,
-            160,
-            320
-          ],
+          "enum": [96, 160, 320],
           "default": 160
         },
         "volume_steps": {
@@ -297,8 +273,7 @@
           "default": false
         }
       },
-      "required": [
-      ],
+      "required": [],
       "title": "config"
     }
   }

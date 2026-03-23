@@ -12,9 +12,18 @@ func GetFormatBitrate(format metadatapb.AudioFile_Format) int {
 		return 160
 	case metadatapb.AudioFile_OGG_VORBIS_320:
 		return 320
+	case metadatapb.AudioFile_FLAC_FLAC,
+		metadatapb.AudioFile_FLAC_FLAC_24BIT:
+		return 320 // FLAC is lossless, use 320 as reference bitrate
 	default:
 		return 0
 	}
+}
+
+// isFormatSupported checks if a format is supported by the player
+func isFormatSupported(format metadatapb.AudioFile_Format) bool {
+	audioFormat := GetAudioFileFormatAudioFormat(format)
+	return audioFormat == AudioFormatOGGVorbis || audioFormat == AudioFormatFLAC
 }
 
 type AudioFormat int
@@ -65,9 +74,15 @@ func selectBestMediaFormat(files []*metadatapb.AudioFile, preferredBitrate int, 
 
 	// Pick the best format by selecting which has the smallest distance from the preferred bitrate,
 	// unless FLAC is requested, in which case pick FLAC if available.
+	// Only consider formats that are supported by the player.
 	var best *metadatapb.AudioFile
 	var bestDist int
 	for _, ff := range files {
+		// Skip unsupported formats
+		if !isFormatSupported(*ff.Format) {
+			continue
+		}
+
 		if flac && (*ff.Format == metadatapb.AudioFile_FLAC_FLAC_24BIT || *ff.Format == metadatapb.AudioFile_FLAC_FLAC) {
 			return ff
 		}
