@@ -3,7 +3,6 @@ package go_librespot
 import (
 	"encoding/json"
 	"fmt"
-	"os"
 	"path/filepath"
 	"sync"
 )
@@ -28,53 +27,55 @@ func (s *AppState) SetLogger(log Logger) {
 }
 
 func (s *AppState) Read(configDir string) error {
+	// Keep the config path for compatibility, but do not perform any file I/O.
+	// Persistence is the responsibility of the embedding app; the AppState will
+	// receive state via LoadFromJSON()/DumpToJSON() instead of reading from disk.
 	s.path = filepath.Join(configDir, "state.json")
 
-	if content, err := os.ReadFile(s.path); err == nil {
-		if err := json.Unmarshal(content, &s); err != nil {
-			return fmt.Errorf("failed unmarshalling state file: %w", err)
-		}
-		s.log.Debugf("app state loaded")
-	} else {
-		s.log.Debugf("no app state found")
+	if s.log != nil {
+		s.log.Debugf("app state file I/O disabled: host is responsible for providing persisted state")
 	}
-
-	// Read credentials (old configuration, in credentials.json).
-	if s.Credentials.Username == "" {
-		if content, err := os.ReadFile(filepath.Join(configDir, "credentials.json")); err == nil {
-			if err := json.Unmarshal(content, &s.Credentials); err != nil {
-				return fmt.Errorf("failed unmarshalling stored credentials file: %w", err)
-			}
-
-			s.log.WithField("username", ObfuscateUsername(s.Credentials.Username)).
-				Debugf("stored credentials found")
-		} else {
-			s.log.Debugf("stored credentials not found")
-		}
-	}
-
 	return nil
 }
 
-func (s *AppState) Write() error {
+// LoadFromJSON replaces the previous disk-based Read semantics.
+// The embedding application should call LoadFromJSON with the bytes it has
+// persisted (for example, read from a file or secure storage) to populate
+// the in-memory state.
+func (s *AppState) LoadFromJSON(data []byte) error {
 	s.Lock()
 	defer s.Unlock()
 
-	// Create a temporary file, and overwrite the old file.
-	// This is a way to atomically replace files.
-	// The file is created with mode 0o600 so we don't need to change the mode.
-	tmpFile, err := os.CreateTemp(filepath.Dir(s.path), filepath.Base(s.path)+".*.tmp")
+	if err := json.Unmarshal(data, s); err != nil {
+		return fmt.Errorf("failed unmarshalling state json: %w", err)
+	}
+
+	if s.log != nil {
+		s.log.Debugf("app state loaded from provided JSON")
+	}
+	return nil
+}
+
+// DumpToJSON returns the JSON representation of the current in-memory state.
+// The embedding app can call this method and persist the returned bytes to disk
+// or to any secure storage it prefers.
+func (s *AppState) DumpToJSON() ([]byte, error) {
+	s.Lock()
+	defer s.Unlock()
+
+	b, err := json.Marshal(s)
 	if err != nil {
-		return fmt.Errorf("failed creating temporary file for app state: %w", err)
+		return nil, fmt.Errorf("failed marshalling state json: %w", err)
 	}
+	return b, nil
+}
 
-	if err := json.NewEncoder(tmpFile).Encode(&s); err != nil {
-		return fmt.Errorf("failed writing marshalled app state: %w", err)
+func (s *AppState) Write() error {
+	// Disable automatic disk writes from the library. The embedding application
+	// owns persistence and should use DumpToJSON() to obtain the state bytes,
+	// then store them where appropriate.
+	if s.log != nil {
+		s.log.Debugf("app state Write() disabled: host is responsible for persisting state")
 	}
-
-	if err := os.Rename(tmpFile.Name(), s.path); err != nil {
-		return fmt.Errorf("failed replacing app state file: %w", err)
-	}
-
 	return nil
 }
