@@ -3,7 +3,6 @@ package player
 import (
 	"context"
 	"fmt"
-	"io"
 	"math"
 	"net/http"
 	"net/url"
@@ -11,7 +10,6 @@ import (
 
 	librespot "github.com/devgianlu/go-librespot"
 	"github.com/devgianlu/go-librespot/audio"
-	"github.com/devgianlu/go-librespot/flac"
 	"github.com/devgianlu/go-librespot/output"
 	"github.com/devgianlu/go-librespot/playplay"
 	downloadpb "github.com/devgianlu/go-librespot/proto/spotify/download"
@@ -693,20 +691,6 @@ func (p *Player) NewStream(ctx context.Context, client *http.Client, spotId libr
 		}
 
 		stream = vorbisStream
-	} else if audioFormat == AudioFormatFLAC {
-		audioStream := io.NewSectionReader(decryptedStream, 0, rawStream.Size())
-		flacStream, err := flac.New(log, audioStream, normalisationFactor)
-		if err != nil {
-			return nil, fmt.Errorf("failed initializing flac stream: %w", err)
-		}
-
-		if flacStream.SampleRate != SampleRate {
-			return nil, fmt.Errorf("unsupported sample rate: %d", flacStream.SampleRate)
-		} else if flacStream.Channels != Channels {
-			return nil, fmt.Errorf("unsupported channels: %d", flacStream.Channels)
-		}
-
-		stream = flacStream
 	} else {
 		return nil, fmt.Errorf("unsupported audio format: %s", *file.Format)
 	}

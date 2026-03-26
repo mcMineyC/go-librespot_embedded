@@ -237,8 +237,8 @@ func (p *AppPlayer) loadContext(ctx context.Context, spotCtx *connectpb.Context,
 
 	p.state.player.ContextUri = spotCtx.Uri
 	p.state.player.ContextUrl = spotCtx.Url
-	p.state.player.Restrictions = spotCtx.Restrictions
-	p.state.player.ContextRestrictions = spotCtx.Restrictions
+	p.state.player.Restrictions = proto.Clone(spotCtx.Restrictions).(*connectpb.Restrictions)
+	p.state.player.ContextRestrictions = proto.Clone(spotCtx.Restrictions).(*connectpb.Restrictions)
 
 	if spotCtx.Restrictions != nil {
 		if len(spotCtx.Restrictions.DisallowTogglingShuffleReasons) > 0 {
@@ -549,6 +549,44 @@ func (p *AppPlayer) seek(ctx context.Context, position int64) error {
 	})
 
 	return nil
+}
+
+// skipPrevTo walks backwards through the track list until it finds the track
+// with the given URI, then loads it. If the URI is not found in PrevTracks
+// it falls back to a single skipPrev step.
+func (p *AppPlayer) skipPrevTo(ctx context.Context, uri string) error {
+	if p.state.tracks == nil {
+		return fmt.Errorf("no active context")
+	}
+
+	// Walk back one step at a time until we either find the target URI or
+	// run out of prev tracks. We compare against the current track after
+	// each GoPrev so we stop as soon as it becomes current.
+	for _, t := range p.state.player.PrevTracks {
+		if t.Uri != uri {
+			continue
+		}
+		// Found it — count how many steps back it is so we can GoPrev that
+		// many times. PrevTracks is oldest-first so the target's distance is
+		// (len - index) steps back from current.
+		for {
+			p.state.tracks.GoPrev()
+			p.state.player.Track = p.state.tracks.CurrentTrack()
+			if p.state.player.Track.Uri == uri {
+				break
+			}
+		}
+		p.state.player.PrevTracks = p.state.tracks.PrevTracks()
+		p.state.player.NextTracks = p.state.tracks.NextTracks(ctx, nil)
+		p.state.player.Index = p.state.tracks.Index()
+		p.state.player.Timestamp = time.Now().UnixMilli()
+		p.state.player.PositionAsOfTimestamp = 0
+		p.sess.Events().OnPlayerSkipBackward(p.primaryStream, p.player.PositionMs())
+		return p.loadCurrentTrack(ctx, p.state.player.IsPaused, true)
+	}
+
+	// URI not found in known prev tracks — fall back to single step.
+	return p.skipPrev(ctx, false)
 }
 
 func (p *AppPlayer) skipPrev(ctx context.Context, allowSeeking bool) error {

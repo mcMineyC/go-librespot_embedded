@@ -467,6 +467,12 @@ func (p *AppPlayer) handleApiRequest(ctx context.Context, req ApiRequest) (any, 
 	case ApiRequestTypePrev:
 		_ = p.skipPrev(ctx, true)
 		return nil, nil
+	case ApiRequestTypePrevTo:
+		data := req.Data.(ApiRequestDataNext)
+		if data.Uri != nil && *data.Uri != "" {
+			_ = p.skipPrevTo(ctx, *data.Uri)
+		}
+		return nil, nil
 	case ApiRequestTypeNext:
 		data := req.Data.(ApiRequestDataNext)
 		if data.Uri != nil {
@@ -759,6 +765,17 @@ func (p *AppPlayer) ApiNext(uri string) error {
 
 func (p *AppPlayer) ApiPrev() error {
 	_, err := p.handleApiRequest(context.Background(), ApiRequest{Type: ApiRequestTypePrev})
+	return err
+}
+
+func (p *AppPlayer) ApiPrevTo(uri string) error {
+	if uri == "" {
+		return p.ApiPrev()
+	}
+	_, err := p.handleApiRequest(context.Background(), ApiRequest{
+		Type: ApiRequestTypePrevTo,
+		Data: ApiRequestDataNext{Uri: &uri},
+	})
 	return err
 }
 

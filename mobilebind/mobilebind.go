@@ -289,9 +289,10 @@ func (l *Librespot) Next() error {
 	return l.player.ApiNext("")
 }
 
-// SkipToTrack skips directly to the track with the given Spotify URI within
-// the current context. Use ContextTracks to obtain candidate URIs.
-func (l *Librespot) SkipToTrack(uri string) error {
+// SkipToNextTrack skips forward to the track with the given Spotify URI within
+// the current context. The URI must appear in NextTracks. Use ContextTracks
+// to obtain candidate URIs.
+func (l *Librespot) SkipToNextTrack(uri string) error {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	if l.player == nil {
@@ -301,6 +302,21 @@ func (l *Librespot) SkipToTrack(uri string) error {
 		return fmt.Errorf("uri must not be empty")
 	}
 	return l.player.ApiNext(uri)
+}
+
+// SkipToPrevTrack skips backward to the track with the given Spotify URI within
+// the current context. The URI must appear in PrevTracks. Use ContextTracks
+// to obtain candidate URIs.
+func (l *Librespot) SkipToPrevTrack(uri string) error {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.player == nil {
+		return fmt.Errorf("not started")
+	}
+	if uri == "" {
+		return fmt.Errorf("uri must not be empty")
+	}
+	return l.player.ApiPrevTo(uri)
 }
 
 // TrackInfo holds the URI and name for a track in the context.

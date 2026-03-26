@@ -14,10 +14,19 @@ import (
 
 type cb struct {
 	credentialsPath string
+	currentName     string // updated on each metadata event
 }
 
 func (c *cb) OnState(event string, payloadJson string) {
 	fmt.Printf("[STATE] %s -> %s\n", event, payloadJson)
+	if event == "metadata" {
+		var meta struct {
+			Name string `json:"name"`
+		}
+		if err := json.Unmarshal([]byte(payloadJson), &meta); err == nil && meta.Name != "" {
+			c.currentName = meta.Name
+		}
+	}
 }
 
 func (c *cb) OnLog(level string, message string) {
@@ -191,6 +200,75 @@ func main() {
 				fmt.Println("Previous error:", err)
 			} else {
 				fmt.Println("Previous requested")
+			}
+		case "jump":
+			prev, next := lib.ContextTracks(5)
+			if len(prev) == 0 && len(next) == 0 {
+				fmt.Println("No surrounding tracks available (is something playing?)")
+				break
+			}
+
+			// Build a flat list with labels, tracking which index is the
+			// boundary between prev and next so we can annotate it.
+			type entry struct {
+				label string
+				uri   string
+			}
+			// Resolve the current track name from the most recent metadata event.
+			currentLabel := "(current track)"
+			if callback.currentName != "" {
+				currentLabel = "▶  " + callback.currentName
+			}
+			const currentURI = "" // sentinel: selecting this is a no-op
+
+			var items []entry
+			for i, t := range prev {
+				label := t.URI
+				if t.Name != "" {
+					label = t.Name
+				}
+				items = append(items, entry{fmt.Sprintf("← %d  %s", len(prev)-i, label), t.URI})
+			}
+			items = append(items, entry{currentLabel, currentURI})
+			prevBoundary := len(items) // items[prevBoundary] will be the first next-track
+			for i, t := range next {
+				label := t.URI
+				if t.Name != "" {
+					label = t.Name
+				}
+				items = append(items, entry{fmt.Sprintf("→ %d  %s", i+1, label), t.URI})
+			}
+
+			labels := make([]string, len(items))
+			for i, it := range items {
+				labels[i] = it.label
+			}
+
+			select_ := promptui.Select{
+				Label: "Jump to track",
+				Items: labels,
+				Size:  len(labels),
+			}
+			idx, _, err := select_.Run()
+			if err != nil {
+				fmt.Println("Jump cancelled:", err)
+				break
+			}
+			chosen := items[idx]
+			if chosen.uri == currentURI {
+				fmt.Println("Already on this track.")
+				break
+			}
+			var jumpErr error
+			if idx < len(prev) {
+				jumpErr = lib.SkipToPrevTrack(chosen.uri)
+			} else if idx >= prevBoundary {
+				jumpErr = lib.SkipToNextTrack(chosen.uri)
+			}
+			if jumpErr != nil {
+				fmt.Println("Jump error:", jumpErr)
+			} else {
+				fmt.Println("Jumped to:", chosen.label)
 			}
 		case "bg", "background":
 			if err := lib.OnBackground(); err != nil {

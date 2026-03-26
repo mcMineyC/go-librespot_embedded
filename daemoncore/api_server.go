@@ -62,6 +62,7 @@ const (
 	ApiRequestTypePlayPause           ApiRequestType = "playpause"
 	ApiRequestTypeSeek                ApiRequestType = "seek"
 	ApiRequestTypePrev                ApiRequestType = "prev"
+	ApiRequestTypePrevTo              ApiRequestType = "prev_to"
 	ApiRequestTypeNext                ApiRequestType = "next"
 	ApiRequestTypePlay                ApiRequestType = "play"
 	ApiRequestTypeGetVolume           ApiRequestType = "get_volume"
