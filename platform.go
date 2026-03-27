@@ -9,15 +9,15 @@ import (
 
 func GetOS() spotifypb.Os {
 	switch runtime.GOOS {
-	case "android":
-		return spotifypb.Os_OS_ANDROID
+	/*case "android":
+	return spotifypb.Os_OS_ANDROID*/
 	case "darwin":
 		return spotifypb.Os_OS_OSX
 	case "freebsd":
 		return spotifypb.Os_OS_FREEBSD
-	case "ios":
-		return spotifypb.Os_OS_IPHONE
-	case "linux":
+	/*case "ios":
+	return spotifypb.Os_OS_IPHONE*/
+	case "linux", "android", "ios":
 		return spotifypb.Os_OS_LINUX
 	case "windows":
 		return spotifypb.Os_OS_WINDOWS
@@ -49,8 +49,8 @@ func GetCpuFamily() spotifypb.CpuFamily {
 
 func GetPlatform() spotifypb.Platform {
 	switch runtime.GOOS {
-	case "android":
-		return spotifypb.Platform_PLATFORM_ANDROID_ARM
+	/*case "android":
+	return spotifypb.Platform_PLATFORM_ANDROID_ARM*/
 	case "darwin":
 		switch runtime.GOARCH {
 		case "386":
@@ -67,14 +67,14 @@ func GetPlatform() spotifypb.Platform {
 		case "amd64":
 			return spotifypb.Platform_PLATFORM_FREEBSD_X86_64
 		}
-	case "ios":
-		switch runtime.GOARCH {
-		case "arm":
-			return spotifypb.Platform_PLATFORM_IPHONE_ARM
-		case "arm64":
-			return spotifypb.Platform_PLATFORM_IPHONE_ARM64
-		}
-	case "linux":
+	/*case "ios":
+	switch runtime.GOARCH {
+	case "arm":
+		return spotifypb.Platform_PLATFORM_IPHONE_ARM
+	case "arm64":
+		return spotifypb.Platform_PLATFORM_IPHONE_ARM64
+		}*/
+	case "linux", "android", "ios":
 		switch runtime.GOARCH {
 		case "386":
 			return spotifypb.Platform_PLATFORM_LINUX_X86
@@ -109,25 +109,13 @@ func GetPlatform() spotifypb.Platform {
 
 func GetPlatformSpecificData() *clienttokenpb.PlatformSpecificData {
 	switch runtime.GOOS {
-	case "android":
-		return &clienttokenpb.PlatformSpecificData{
-			Data: &clienttokenpb.PlatformSpecificData_Android{
-				Android: &clienttokenpb.NativeAndroidData{},
-			},
-		}
 	case "darwin":
 		return &clienttokenpb.PlatformSpecificData{
 			Data: &clienttokenpb.PlatformSpecificData_DesktopMacos{
 				DesktopMacos: &clienttokenpb.NativeDesktopMacOSData{},
 			},
 		}
-	case "ios":
-		return &clienttokenpb.PlatformSpecificData{
-			Data: &clienttokenpb.PlatformSpecificData_Ios{
-				Ios: &clienttokenpb.NativeIOSData{},
-			},
-		}
-	case "linux", "freebsd":
+	case "linux", "freebsd", "android", "ios":
 		return &clienttokenpb.PlatformSpecificData{
 			Data: &clienttokenpb.PlatformSpecificData_DesktopLinux{
 				DesktopLinux: &clienttokenpb.NativeDesktopLinuxData{},

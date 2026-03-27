@@ -4,8 +4,8 @@
 
 # Configuration files
 /config.yml
-/credentials.json
-/state.json
+creds.json
+state.json
 /lockfile
 
 # Build files
@@ -13,3 +13,4 @@
 /vcpkg
 /vcpkg_installed
 /dist
+.DS_Store
