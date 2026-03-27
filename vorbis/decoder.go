@@ -1,5 +1,16 @@
 package vorbis
 
+/*
+#cgo CFLAGS: -I${SRCDIR}/include
+
+#cgo android,arm64 LDFLAGS: ${SRCDIR}/native/arm64-v8a/libogg.a ${SRCDIR}/native/arm64-v8a/libvorbis.a -lm
+#cgo android,arm LDFLAGS:   ${SRCDIR}/native/armeabi-v7a/libogg.a ${SRCDIR}/native/armeabi-v7a/libvorbis.a -lm
+#cgo android,386 LDFLAGS:   ${SRCDIR}/native/x86/libogg.a ${SRCDIR}/native/x86/libvorbis.a -lm
+#cgo android,amd64 LDFLAGS: ${SRCDIR}/native/x86_64/libogg.a ${SRCDIR}/native/x86_64/libvorbis.a -lm
+#cgo LDFLAGS: -lm -lvorbisfile
+
+*/
+import "C"
 import (
 	"errors"
 	"fmt"
