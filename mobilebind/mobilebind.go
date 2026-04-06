@@ -58,6 +58,55 @@ type Librespot struct {
 	started      bool
 }
 
+// DeviceInfo describes a Spotify Connect device from the cached cluster
+// (gomobile export; same fields as daemoncore.DeviceInfo).
+type DeviceInfo struct {
+	Id             string
+	Name           string
+	Type           string
+	IsActive       bool
+	Volume         int
+	SupportsVolume bool
+}
+
+// QueueInfo is a snapshot of the playback queue (gomobile export).
+type QueueInfo struct {
+	Current *TrackInfo
+	Prev    []TrackInfo
+	Next    []TrackInfo
+}
+
+func deviceInfoFromDaemon(d daemon.DeviceInfo) DeviceInfo {
+	return DeviceInfo{
+		Id:             d.Id,
+		Name:           d.Name,
+		Type:           d.Type,
+		IsActive:       d.IsActive,
+		Volume:         d.Volume,
+		SupportsVolume: d.SupportsVolume,
+	}
+}
+
+func queueInfoFromDaemon(q *daemon.QueueInfo) *QueueInfo {
+	if q == nil {
+		return &QueueInfo{Prev: []TrackInfo{}, Next: []TrackInfo{}}
+	}
+	out := &QueueInfo{
+		Prev: make([]TrackInfo, 0, len(q.Prev)),
+		Next: make([]TrackInfo, 0, len(q.Next)),
+	}
+	if q.Current != nil {
+		out.Current = &TrackInfo{URI: q.Current.URI, Name: q.Current.Name}
+	}
+	for _, t := range q.Prev {
+		out.Prev = append(out.Prev, TrackInfo{URI: t.URI, Name: t.Name})
+	}
+	for _, t := range q.Next {
+		out.Next = append(out.Next, TrackInfo{URI: t.URI, Name: t.Name})
+	}
+	return out
+}
+
 func NewLibrespot() *Librespot {
 	return &Librespot{}
 }
@@ -336,11 +385,11 @@ func (l *Librespot) SkipToPrevTrack(uri string) error {
 }
 
 // ---------------------------------------------------------------------------
-// Seek
+// Api* entry points (gomobile-friendly; mirror daemoncore AppPlayer)
 // ---------------------------------------------------------------------------
 
-// Seek seeks to positionMs milliseconds from the start of the current track.
-func (l *Librespot) Seek(positionMs int64) error {
+// ApiSeek seeks the current track to positionMs (milliseconds from start).
+func (l *Librespot) ApiSeek(positionMs int64) error {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	if l.player == nil {
@@ -349,15 +398,8 @@ func (l *Librespot) Seek(positionMs int64) error {
 	return l.player.ApiSeek(positionMs)
 }
 
-// ---------------------------------------------------------------------------
-// Repeat & Shuffle
-// ---------------------------------------------------------------------------
-
-// SetRepeat sets the repeat mode. mode must be one of:
-//   - "off"     — no repeat
-//   - "context" — repeat the current playlist/album
-//   - "track"   — repeat the current track indefinitely
-func (l *Librespot) SetRepeat(mode string) error {
+// ApiSetRepeat sets repeat mode: off | context | track.
+func (l *Librespot) ApiSetRepeat(mode string) error {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	if l.player == nil {
@@ -366,8 +408,8 @@ func (l *Librespot) SetRepeat(mode string) error {
 	return l.player.ApiSetRepeat(mode)
 }
 
-// SetShuffle enables or disables shuffle on the current context.
-func (l *Librespot) SetShuffle(enabled bool) error {
+// ApiSetShuffle enables or disables shuffle for the current context.
+func (l *Librespot) ApiSetShuffle(enabled bool) error {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	if l.player == nil {
@@ -376,20 +418,150 @@ func (l *Librespot) SetShuffle(enabled bool) error {
 	return l.player.ApiSetShuffle(enabled)
 }
 
-// ---------------------------------------------------------------------------
-// Volume
-// ---------------------------------------------------------------------------
-
-// SetVolume sets the playback volume. vol is an integer in the range
-// 0..VolumeSteps (typically 0..100). Use GetVolumeJSON to read the current
-// value and the configured maximum.
-func (l *Librespot) SetVolume(vol int32) error {
+// ApiSetVolume sets volume to vol steps (0..VolumeSteps from config).
+func (l *Librespot) ApiSetVolume(vol int32) error {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	if l.player == nil {
 		return fmt.Errorf("not started")
 	}
 	return l.player.ApiSetVolume(vol)
+}
+
+// ApiGetVolume returns the current volume step and configured maximum.
+func (l *Librespot) ApiGetVolume() (value uint32, max uint32) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.player == nil {
+		return 0, 0
+	}
+	return l.player.ApiGetVolume()
+}
+
+// ApiPlayUri loads a Spotify context URI; skipToUri and paused as in daemoncore.
+func (l *Librespot) ApiPlayUri(uri, skipToUri string, paused bool) error {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.player == nil {
+		return fmt.Errorf("not started")
+	}
+	if uri == "" {
+		return fmt.Errorf("uri must not be empty")
+	}
+	return l.player.ApiPlayUri(uri, skipToUri, paused)
+}
+
+// ApiAddToQueue appends a track or episode URI to the play-ahead queue.
+func (l *Librespot) ApiAddToQueue(uri string) error {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.player == nil {
+		return fmt.Errorf("not started")
+	}
+	if uri == "" {
+		return fmt.Errorf("uri must not be empty")
+	}
+	return l.player.ApiAddToQueue(uri)
+}
+
+// ApiRemoveFromQueue removes the first matching URI from the next queue.
+func (l *Librespot) ApiRemoveFromQueue(uri string) error {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.player == nil {
+		return fmt.Errorf("not started")
+	}
+	if uri == "" {
+		return fmt.Errorf("uri must not be empty")
+	}
+	return l.player.ApiRemoveFromQueue(uri)
+}
+
+// ApiGetQueue returns a snapshot of current, previous, and next tracks.
+func (l *Librespot) ApiGetQueue() *QueueInfo {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.player == nil {
+		return &QueueInfo{Prev: []TrackInfo{}, Next: []TrackInfo{}}
+	}
+	return queueInfoFromDaemon(l.player.ApiGetQueue())
+}
+
+// ApiClearQueueCtx clears user-queued items using ctx.
+func (l *Librespot) ApiClearQueueCtx(ctx context.Context) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.player == nil {
+		return
+	}
+	l.player.ApiClearQueue(ctx)
+}
+
+// ApiClearQueue uses a background context.
+func (l *Librespot) ApiClearQueue() {
+	l.ApiClearQueueCtx(context.Background())
+}
+
+// ApiListDevices returns visible Connect devices from the cached cluster.
+func (l *Librespot) ApiListDevices() []DeviceInfo {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.player == nil {
+		return nil
+	}
+	raw := l.player.ApiListDevices()
+	out := make([]DeviceInfo, len(raw))
+	for i := range raw {
+		out[i] = deviceInfoFromDaemon(raw[i])
+	}
+	return out
+}
+
+// ApiTransferPlaybackCtx moves playback to deviceId using ctx.
+func (l *Librespot) ApiTransferPlaybackCtx(ctx context.Context, deviceId string, play bool) error {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.player == nil {
+		return fmt.Errorf("not started")
+	}
+	if deviceId == "" {
+		return fmt.Errorf("deviceId must not be empty")
+	}
+	return l.player.ApiTransferPlayback(ctx, deviceId, play)
+}
+
+// ApiTransferPlayback uses a background context.
+func (l *Librespot) ApiTransferPlayback(deviceId string, play bool) error {
+	return l.ApiTransferPlaybackCtx(context.Background(), deviceId, play)
+}
+
+// ---------------------------------------------------------------------------
+// Seek, repeat, shuffle, volume, URI, queue (friendly names)
+// ---------------------------------------------------------------------------
+
+// Seek is equivalent to ApiSeek.
+func (l *Librespot) Seek(positionMs int64) error {
+	return l.ApiSeek(positionMs)
+}
+
+// SetRepeat sets the repeat mode. mode must be one of:
+//   - "off"     — no repeat
+//   - "context" — repeat the current playlist/album
+//   - "track"   — repeat the current track indefinitely
+func (l *Librespot) SetRepeat(mode string) error {
+	return l.ApiSetRepeat(mode)
+}
+
+// SetShuffle enables or disables shuffle on the current context.
+func (l *Librespot) SetShuffle(enabled bool) error {
+	return l.ApiSetShuffle(enabled)
+}
+
+// SetVolume sets the playback volume. vol is an integer in the range
+// 0..VolumeSteps (typically 0..100). Use GetVolumeJSON to read the current
+// value and the configured maximum.
+func (l *Librespot) SetVolume(vol int32) error {
+	return l.ApiSetVolume(vol)
 }
 
 // GetVolumeJSON returns the current volume state as a JSON string:
@@ -412,10 +584,6 @@ func (l *Librespot) GetVolumeJSON() string {
 	return string(b)
 }
 
-// ---------------------------------------------------------------------------
-// URI-based playback
-// ---------------------------------------------------------------------------
-
 // PlayUri starts playback of any Spotify URI. Supported URI types:
 //   - spotify:track:<id>
 //   - spotify:episode:<id>
@@ -429,48 +597,18 @@ func (l *Librespot) GetVolumeJSON() string {
 // skipToUri, if non-empty, skips within the context to that specific track.
 // paused controls whether playback starts paused.
 func (l *Librespot) PlayUri(uri string, skipToUri string, paused bool) error {
-	l.mu.Lock()
-	defer l.mu.Unlock()
-	if l.player == nil {
-		return fmt.Errorf("not started")
-	}
-	if uri == "" {
-		return fmt.Errorf("uri must not be empty")
-	}
-	return l.player.ApiPlayUri(uri, skipToUri, paused)
+	return l.ApiPlayUri(uri, skipToUri, paused)
 }
 
-// ---------------------------------------------------------------------------
-// Queue management
-// ---------------------------------------------------------------------------
-
 // AddToQueue appends a Spotify track or episode URI to the playback queue.
-// The track will play after the current track (and any other queued tracks).
 func (l *Librespot) AddToQueue(uri string) error {
-	l.mu.Lock()
-	defer l.mu.Unlock()
-	if l.player == nil {
-		return fmt.Errorf("not started")
-	}
-	if uri == "" {
-		return fmt.Errorf("uri must not be empty")
-	}
-	return l.player.ApiAddToQueue(uri)
+	return l.ApiAddToQueue(uri)
 }
 
 // RemoveFromQueue removes the first occurrence of uri from the play-ahead
 // (next) queue. Returns an error if the URI is not found in the queue.
-// The current track and history (prev) tracks are not affected.
 func (l *Librespot) RemoveFromQueue(uri string) error {
-	l.mu.Lock()
-	defer l.mu.Unlock()
-	if l.player == nil {
-		return fmt.Errorf("not started")
-	}
-	if uri == "" {
-		return fmt.Errorf("uri must not be empty")
-	}
-	return l.player.ApiRemoveFromQueue(uri)
+	return l.ApiRemoveFromQueue(uri)
 }
 
 // GetQueueJSON returns a JSON snapshot of the current playback queue:
@@ -485,11 +623,12 @@ func (l *Librespot) RemoveFromQueue(uri string) error {
 // Returns "{}" if not started.
 func (l *Librespot) GetQueueJSON() string {
 	l.mu.Lock()
-	defer l.mu.Unlock()
 	if l.player == nil {
+		l.mu.Unlock()
 		return "{}"
 	}
-	q := l.player.ApiGetQueue()
+	q := queueInfoFromDaemon(l.player.ApiGetQueue())
+	l.mu.Unlock()
 
 	type trackJSON struct {
 		URI  string `json:"uri"`
@@ -519,15 +658,9 @@ func (l *Librespot) GetQueueJSON() string {
 	return string(b)
 }
 
-// ClearQueue removes all user-queued tracks from the play-ahead list.
-// Context tracks (the normal album/playlist sequence) are not affected.
+// ClearQueue is equivalent to ApiClearQueue.
 func (l *Librespot) ClearQueue() {
-	l.mu.Lock()
-	defer l.mu.Unlock()
-	if l.player == nil {
-		return
-	}
-	l.player.ApiClearQueue(context.Background())
+	l.ApiClearQueue()
 }
 
 // ---------------------------------------------------------------------------
@@ -623,13 +756,10 @@ func (l *Librespot) ContextTracks(n int) (prev []TrackInfo, next []TrackInfo) {
 // requires no network round-trip. Returns "[]" if not started or if no
 // cluster data has been received yet (falls back to the local device only).
 func (l *Librespot) ListDevicesJSON() string {
-	l.mu.Lock()
-	defer l.mu.Unlock()
-	if l.player == nil {
+	devices := l.ApiListDevices()
+	if len(devices) == 0 {
 		return "[]"
 	}
-
-	devices := l.player.ApiListDevices()
 
 	type deviceJSON struct {
 		Id             string `json:"id"`
@@ -651,27 +781,18 @@ func (l *Librespot) ListDevicesJSON() string {
 			SupportsVolume: d.SupportsVolume,
 		})
 	}
-
 	b, _ := json.Marshal(out)
 	return string(b)
 }
 
 // TransferPlayback transfers active playback to the device with the given ID.
-// Use ListDevicesJSON to obtain the device ID. If play is true, playback
+// Use ListDevicesJSON or ApiListDevices to obtain the device ID. If play is true, playback
 // starts immediately on the target device; otherwise it transfers paused.
 //
 // The transfer uses the connect-state transfer endpoint (same mechanism as
 // librespot and the Spotify desktop client), not the Web API.
 func (l *Librespot) TransferPlayback(deviceId string, play bool) error {
-	l.mu.Lock()
-	defer l.mu.Unlock()
-	if l.player == nil {
-		return fmt.Errorf("not started")
-	}
-	if deviceId == "" {
-		return fmt.Errorf("deviceId must not be empty")
-	}
-	return l.player.ApiTransferPlayback(context.Background(), deviceId, play)
+	return l.ApiTransferPlayback(deviceId, play)
 }
 
 // ---------------------------------------------------------------------------

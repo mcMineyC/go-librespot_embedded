@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -31,6 +32,43 @@ func (c *cb) OnEvent(event string, payloadJson string) {
 
 func (c *cb) OnLog(level string, message string) {
 	fmt.Printf("[LOG] %s: %s\n", level, message)
+}
+
+// replHelpText lists every interactive command understood by the mobile_host REPL.
+// Keep this in sync with the switch in main().
+const replHelpText = `Available commands:
+  play              Resume playback
+  pause             Pause playback
+  next              Skip to next track in context
+  prev, previous    Previous track (or seek to start if past ~3s)
+  jump              Pick a track from surrounding context (prev / current / next)
+  seek <ms>         Seek to position in milliseconds from track start
+  playuri <uri> [skip_to_uri] [paused]
+                    Load a context URI; optional skip-to track URI; suffix "paused" to start paused
+  addtoqueue <uri>  Append track or episode URI to the play-ahead queue
+  removefromqueue <uri>
+                    Remove first matching URI from the next queue
+  getqueue, queue   Print current / prev / next queue (JSON, indented)
+  clearqueue        Remove user-queued items (context sequence unchanged)
+  getvolume         Print volume as JSON {"value","max"}
+  setvolume <n>     Set volume step (0 .. volume_steps from config)
+  setrepeat <mode>  off | context | track
+  setshuffle on|off Shuffle for current context
+  devices           Print Connect devices from cached cluster (JSON, indented)
+  transfer          Choose a device and move playback here (starts playing)
+  bg, background    Simulate app background (pause)
+  fg, foreground    Simulate app foreground (resume)
+  stop              Shut down librespot (cancels background work; session not usable until restart)
+  exit, quit        Stop librespot and exit the program
+  help, ?           Show this list
+
+Notes:
+  - devices / transfer need cluster data; play something from Spotify once if the list is empty.
+  - For programmatic control, use mobilebind.Librespot (Api* methods mirror daemoncore).
+`
+
+func printReplHelp() {
+	fmt.Print(replHelpText)
 }
 
 func (c *cb) OnCredentialsPersist(credentialsJson string) error {
@@ -163,9 +201,9 @@ func main() {
 		}
 	}
 
-	// Simple REPL: accept commands to control playback/lifecycle
+	// Simple REPL: accept commands to control playback/lifecycle (see replHelpText).
 	fmt.Println()
-	fmt.Println("Enter commands: play, pause, next, prev, jump, bg, fg, stop, exit")
+	fmt.Println("Interactive REPL — type help for commands, exit to quit.")
 	for {
 		prompt := promptui.Prompt{
 			Label: "Command",
@@ -175,33 +213,206 @@ func main() {
 			fmt.Printf("Prompt failed: %v\n", err)
 			continue
 		}
-		cmd := strings.TrimSpace(strings.ToLower(line))
-		switch cmd {
+		fields := strings.Fields(strings.TrimSpace(line))
+		if len(fields) == 0 {
+			continue
+		}
+		verb := strings.ToLower(fields[0])
+		args := fields[1:]
+
+		switch verb {
 		case "play":
+			if len(args) != 0 {
+				fmt.Println("usage: play")
+				break
+			}
 			if err := lib.Play(); err != nil {
 				fmt.Println("Play error:", err)
 			} else {
 				fmt.Println("Play requested")
 			}
 		case "pause":
+			if len(args) != 0 {
+				fmt.Println("usage: pause")
+				break
+			}
 			if err := lib.Pause(); err != nil {
 				fmt.Println("Pause error:", err)
 			} else {
 				fmt.Println("Pause requested")
 			}
 		case "next":
+			if len(args) != 0 {
+				fmt.Println("usage: next")
+				break
+			}
 			if err := lib.Next(); err != nil {
 				fmt.Println("Next error:", err)
 			} else {
 				fmt.Println("Next requested")
 			}
 		case "prev", "previous":
+			if len(args) != 0 {
+				fmt.Println("usage: prev")
+				break
+			}
 			if err := lib.Previous(); err != nil {
 				fmt.Println("Previous error:", err)
 			} else {
 				fmt.Println("Previous requested")
 			}
+		case "seek":
+			if len(args) < 1 {
+				fmt.Println("usage: seek <ms>")
+				break
+			}
+			ms, err := strconv.ParseInt(args[0], 10, 64)
+			if err != nil {
+				fmt.Println("seek: invalid milliseconds:", err)
+				break
+			}
+			if err := lib.ApiSeek(ms); err != nil {
+				fmt.Println("Seek error:", err)
+			} else {
+				fmt.Printf("Seek to %d ms\n", ms)
+			}
+		case "playuri":
+			if len(args) < 1 {
+				fmt.Println("usage: playuri <context_uri> [skip_to_uri] [paused]")
+				break
+			}
+			paused := false
+			rest := args
+			if len(rest) > 0 && strings.EqualFold(rest[len(rest)-1], "paused") {
+				paused = true
+				rest = rest[:len(rest)-1]
+			}
+			uri := rest[0]
+			skip := ""
+			if len(rest) >= 2 {
+				skip = rest[1]
+			}
+			if err := lib.ApiPlayUri(uri, skip, paused); err != nil {
+				fmt.Println("playuri error:", err)
+			} else {
+				fmt.Println("playuri requested:", uri)
+			}
+		case "addtoqueue":
+			if len(args) < 1 {
+				fmt.Println("usage: addtoqueue <uri>")
+				break
+			}
+			uri := args[0]
+			if err := lib.ApiAddToQueue(uri); err != nil {
+				fmt.Println("addtoqueue error:", err)
+			} else {
+				fmt.Println("Added to queue:", uri)
+			}
+		case "removefromqueue":
+			if len(args) < 1 {
+				fmt.Println("usage: removefromqueue <uri>")
+				break
+			}
+			uri := args[0]
+			if err := lib.ApiRemoveFromQueue(uri); err != nil {
+				fmt.Println("removefromqueue error:", err)
+			} else {
+				fmt.Println("Removed from queue:", uri)
+			}
+		case "getqueue", "queue":
+			if len(args) != 0 {
+				fmt.Println("usage: getqueue")
+				break
+			}
+			raw := lib.GetQueueJSON()
+			var v any
+			if err := json.Unmarshal([]byte(raw), &v); err != nil {
+				fmt.Println(raw)
+				break
+			}
+			b, err := json.MarshalIndent(v, "", "  ")
+			if err != nil {
+				fmt.Println(raw)
+				break
+			}
+			fmt.Println(string(b))
+		case "clearqueue":
+			if len(args) != 0 {
+				fmt.Println("usage: clearqueue")
+				break
+			}
+			lib.ApiClearQueue()
+			fmt.Println("Cleared user queue (context tracks kept).")
+		case "getvolume":
+			if len(args) != 0 {
+				fmt.Println("usage: getvolume")
+				break
+			}
+			raw := lib.GetVolumeJSON()
+			var v any
+			if err := json.Unmarshal([]byte(raw), &v); err != nil {
+				fmt.Println(raw)
+				break
+			}
+			b, err := json.MarshalIndent(v, "", "  ")
+			if err != nil {
+				fmt.Println(raw)
+				break
+			}
+			fmt.Println(string(b))
+		case "setvolume":
+			if len(args) < 1 {
+				fmt.Println("usage: setvolume <n>")
+				break
+			}
+			n, err := strconv.ParseInt(args[0], 10, 32)
+			if err != nil {
+				fmt.Println("setvolume: invalid number:", err)
+				break
+			}
+			if err := lib.ApiSetVolume(int32(n)); err != nil {
+				fmt.Println("setvolume error:", err)
+			} else {
+				fmt.Printf("Volume set to %d\n", n)
+			}
+		case "setrepeat":
+			if len(args) < 1 {
+				fmt.Println("usage: setrepeat off|context|track")
+				break
+			}
+			mode := strings.ToLower(args[0])
+			if err := lib.ApiSetRepeat(mode); err != nil {
+				fmt.Println("setrepeat error:", err)
+			} else {
+				fmt.Println("Repeat mode:", mode)
+			}
+		case "setshuffle":
+			if len(args) < 1 {
+				fmt.Println("usage: setshuffle on|off")
+				break
+			}
+			var on bool
+			ok := false
+			switch strings.ToLower(args[0]) {
+			case "on", "true", "1", "yes":
+				on, ok = true, true
+			case "off", "false", "0", "no":
+				on, ok = false, true
+			}
+			if !ok {
+				fmt.Println("setshuffle: use on or off")
+				break
+			}
+			if err := lib.ApiSetShuffle(on); err != nil {
+				fmt.Println("setshuffle error:", err)
+			} else {
+				fmt.Printf("Shuffle: %v\n", on)
+			}
 		case "jump":
+			if len(args) != 0 {
+				fmt.Println("usage: jump")
+				break
+			}
 			prev, next := lib.ContextTracks(5)
 			if len(prev) == 0 && len(next) == 0 {
 				fmt.Println("No surrounding tracks available (is something playing?)")
@@ -271,29 +482,62 @@ func main() {
 				fmt.Println("Jumped to:", chosen.label)
 			}
 		case "devices":
-			fmt.Println(lib.ListDevicesJSON())
+			if len(args) != 0 {
+				fmt.Println("usage: devices")
+				break
+			}
+			devs := lib.ApiListDevices()
+			if len(devs) == 0 {
+				fmt.Println("No devices yet (cluster empty). Start playback from Spotify once to populate.")
+				break
+			}
+			type row struct {
+				ID             string `json:"id"`
+				Name           string `json:"name"`
+				Type           string `json:"type"`
+				IsActive       bool   `json:"is_active"`
+				Volume         int    `json:"volume"`
+				SupportsVolume bool   `json:"supports_volume"`
+			}
+			rows := make([]row, len(devs))
+			for i, d := range devs {
+				rows[i] = row{
+					ID:             d.Id,
+					Name:           d.Name,
+					Type:           d.Type,
+					IsActive:       d.IsActive,
+					Volume:         d.Volume,
+					SupportsVolume: d.SupportsVolume,
+				}
+			}
+			b, err := json.MarshalIndent(rows, "", "  ")
+			if err != nil {
+				fmt.Println("devices:", err)
+				break
+			}
+			fmt.Println(string(b))
 		case "transfer":
-			devicesJSON := lib.ListDevicesJSON()
-			var devices []struct {
-				ID   string `json:"id"`
-				Name string `json:"name"`
-			}
-			if err := json.Unmarshal([]byte(devicesJSON), &devices); err != nil {
-				fmt.Println("Failed parsing devices JSON:", err)
+			if len(args) != 0 {
+				fmt.Println("usage: transfer")
 				break
 			}
+			devices := lib.ApiListDevices()
 			if len(devices) == 0 {
-				fmt.Println("No available devices to transfer to.")
+				fmt.Println("No devices to transfer to.")
 				break
 			}
-			deviceLabels := make([]string, len(devices))
+			labels := make([]string, len(devices))
 			for i, d := range devices {
-				deviceLabels[i] = fmt.Sprintf("%s (%s)", d.Name, d.ID)
+				active := ""
+				if d.IsActive {
+					active = " *active*"
+				}
+				labels[i] = fmt.Sprintf("%s (%s)%s", d.Name, d.Id, active)
 			}
 			select_ := promptui.Select{
 				Label: "Transfer playback to device",
-				Items: deviceLabels,
-				Size:  len(deviceLabels),
+				Items: labels,
+				Size:  len(labels),
 			}
 			idx, _, err := select_.Run()
 			if err != nil {
@@ -301,37 +545,57 @@ func main() {
 				break
 			}
 			chosen := devices[idx]
-			if err := lib.TransferPlayback(chosen.ID, true); err != nil {
+			if err := lib.ApiTransferPlayback(chosen.Id, true); err != nil {
 				fmt.Println("Transfer error:", err)
 			} else {
-				fmt.Printf("Transfer requested to device: %s (%s)\n", chosen.Name, chosen.ID)
+				fmt.Printf("Transfer requested to: %s (%s)\n", chosen.Name, chosen.Id)
 			}
 		case "bg", "background":
+			if len(args) != 0 {
+				fmt.Println("usage: bg")
+				break
+			}
 			if err := lib.OnBackground(); err != nil {
 				fmt.Println("OnBackground error:", err)
 			} else {
 				fmt.Println("OnBackground invoked")
 			}
 		case "fg", "foreground":
+			if len(args) != 0 {
+				fmt.Println("usage: fg")
+				break
+			}
 			if err := lib.OnForeground(); err != nil {
 				fmt.Println("OnForeground error:", err)
 			} else {
 				fmt.Println("OnForeground invoked")
 			}
 		case "stop":
+			if len(args) != 0 {
+				fmt.Println("usage: stop")
+				break
+			}
 			if err := lib.Stop(); err != nil {
 				fmt.Println("Stop error:", err)
 			} else {
 				fmt.Println("Stop requested")
 			}
 		case "exit", "quit":
+			if len(args) != 0 {
+				fmt.Println("usage: exit")
+				break
+			}
 			_ = lib.Stop()
 			fmt.Println("Exiting.")
 			return
-		case "":
-			// ignore empty
+		case "help", "?":
+			if len(args) != 0 {
+				fmt.Println("usage: help")
+				break
+			}
+			printReplHelp()
 		default:
-			fmt.Println("unknown command:", cmd)
+			fmt.Println("unknown command:", verb, "— type help for a list")
 		}
 	}
 }
