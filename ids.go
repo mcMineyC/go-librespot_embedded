@@ -50,6 +50,25 @@ func ContextTrackToProvidedTrack(typ SpotifyIdType, track *connectpb.ContextTrac
 	}
 }
 
+// ProvidedTrackToContextTrack maps player-state queue entries back to the wire
+// shape expected by tracks.List.SetQueue and related logic.
+func ProvidedTrackToContextTrack(track *connectpb.ProvidedTrack) *connectpb.ContextTrack {
+	if track == nil {
+		return nil
+	}
+	ct := &connectpb.ContextTrack{
+		Uri:      track.Uri,
+		Uid:      track.Uid,
+		Metadata: track.Metadata,
+	}
+	if track.Uri != "" {
+		if id, err := SpotifyIdFromUri(track.Uri); err == nil {
+			ct.Gid = id.Id()
+		}
+	}
+	return ct
+}
+
 type SpotifyIdType string
 
 const (
