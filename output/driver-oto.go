@@ -33,6 +33,41 @@ type otoReader struct {
 	bbuf []byte
 }
 
+// Oto permits only one Context per process. The player closes and recreates the
+// output device on stop/transfer, so we must reuse the same Context and only
+// replace the Player (see oto.Context docs: "Creating multiple contexts is NOT supported").
+var (
+	otoSharedMu sync.Mutex
+	otoShared   *oto.Context
+	otoSharedSR int
+	otoSharedCh int
+)
+
+func otoAcquireSharedContext(sampleRate, channelCount int) (*oto.Context, error) {
+	otoSharedMu.Lock()
+	defer otoSharedMu.Unlock()
+	if otoShared != nil {
+		if otoSharedSR != sampleRate || otoSharedCh != channelCount {
+			return nil, fmt.Errorf("oto: shared context is %d Hz / %d ch; output requested %d / %d",
+				otoSharedSR, otoSharedCh, sampleRate, channelCount)
+		}
+		return otoShared, nil
+	}
+	ctx, ready, err := oto.NewContext(&oto.NewContextOptions{
+		SampleRate:   sampleRate,
+		ChannelCount: channelCount,
+		Format:       oto.FormatSignedInt16LE,
+	})
+	if err != nil {
+		return nil, err
+	}
+	<-ready
+	otoShared = ctx
+	otoSharedSR = sampleRate
+	otoSharedCh = channelCount
+	return ctx, nil
+}
+
 func newOtoOutput(opts *NewOutputOptions) (*otoOutput, error) {
 	op := &otoOutput{
 		reader:         opts.Reader,
@@ -43,15 +78,10 @@ func newOtoOutput(opts *NewOutputOptions) (*otoOutput, error) {
 	}
 	op.cond = sync.NewCond(&op.lock)
 
-	ctx, ready, err := oto.NewContext(&oto.NewContextOptions{
-		SampleRate:   opts.SampleRate,
-		ChannelCount: opts.ChannelCount,
-		Format:       oto.FormatSignedInt16LE,
-	})
+	ctx, err := otoAcquireSharedContext(opts.SampleRate, opts.ChannelCount)
 	if err != nil {
 		return nil, err
 	}
-	<-ready
 	op.ctx = ctx
 
 	r := &otoReader{

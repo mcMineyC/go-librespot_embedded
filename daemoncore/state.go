@@ -9,6 +9,7 @@ import (
 	"github.com/devgianlu/go-librespot/player"
 	connectpb "github.com/devgianlu/go-librespot/proto/spotify/connectstate"
 	"github.com/devgianlu/go-librespot/tracks"
+	"google.golang.org/protobuf/proto"
 )
 
 type State struct {
@@ -191,6 +192,25 @@ func (p *AppPlayer) putConnectState(ctx context.Context, reason connectpb.PutSta
 		putStateReq.LastCommandSentByDeviceId = p.state.lastCommand.SentByDeviceId
 	}
 
-	// finally send the state update
+	// For the initial registration we also want the cluster from the response
+	// body so ApiListDevices can show all visible devices right away.
+	if reason == connectpb.PutStateReason_NEW_DEVICE {
+		respBytes, err := p.sess.Spclient().PutConnectStateWithCluster(ctx, p.spotConnId, putStateReq)
+		if err != nil {
+			return err
+		}
+		if len(respBytes) > 0 {
+			var cluster connectpb.Cluster
+			if unmarshalErr := proto.Unmarshal(respBytes, &cluster); unmarshalErr == nil {
+				p.clusterLock.Lock()
+				p.cluster = &cluster
+				p.clusterLock.Unlock()
+			} else {
+				p.app.log.Warnf("failed unmarshalling initial cluster from PutConnectState response: %v", unmarshalErr)
+			}
+		}
+		return nil
+	}
+
 	return p.sess.Spclient().PutConnectState(ctx, p.spotConnId, putStateReq)
 }

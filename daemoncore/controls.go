@@ -17,6 +17,7 @@ import (
 	"github.com/devgianlu/go-librespot/player"
 	connectpb "github.com/devgianlu/go-librespot/proto/spotify/connectstate"
 	playerpb "github.com/devgianlu/go-librespot/proto/spotify/player"
+	"github.com/devgianlu/go-librespot/spclient"
 	"github.com/devgianlu/go-librespot/tracks"
 	"google.golang.org/protobuf/proto"
 )
@@ -801,6 +802,94 @@ func (p *AppPlayer) volumeUpdated(ctx context.Context) {
 			Max:   p.app.cfg.VolumeSteps,
 		},
 	})
+}
+
+// ---------------------------------------------------------------------------
+// Device listing & transfer
+// ---------------------------------------------------------------------------
+
+// DeviceInfo describes a Spotify Connect device seen in the connect-state cluster.
+type DeviceInfo struct {
+	Id             string
+	Name           string
+	Type           string
+	IsActive       bool
+	Volume         int  // 0-100 percent
+	SupportsVolume bool
+}
+
+// QueueInfo holds a snapshot of the playback queue.
+type QueueInfo struct {
+	Current *TrackSummary
+	Prev    []TrackSummary
+	Next    []TrackSummary
+}
+
+// listDevicesFromCluster returns all Spotify Connect devices from the cached
+// cluster state. Falls back to just the local device if no cluster has been
+// received yet. This is instantaneous and requires no network round-trip.
+func (p *AppPlayer) listDevicesFromCluster() []DeviceInfo {
+	p.clusterLock.RLock()
+	cluster := p.cluster
+	p.clusterLock.RUnlock()
+
+	if cluster != nil && len(cluster.Device) > 0 {
+		activeId := cluster.GetActiveDeviceId()
+		devices := make([]DeviceInfo, 0, len(cluster.Device))
+		for id, info := range cluster.Device {
+			vol := int(info.GetVolume()) * 100 / player.MaxStateVolume
+			devices = append(devices, DeviceInfo{
+				Id:             id,
+				Name:           info.GetName(),
+				Type:           info.GetDeviceType().String(),
+				IsActive:       id == activeId,
+				Volume:         vol,
+				SupportsVolume: info.GetCapabilities() != nil && !info.GetCapabilities().GetDisableVolume(),
+			})
+		}
+		return devices
+	}
+
+	// No cluster yet — return at least the local device as a fallback.
+	var devices []DeviceInfo
+	if p.state.device != nil {
+		vol := int(p.state.device.Volume) * 100 / player.MaxStateVolume
+		devices = append(devices, DeviceInfo{
+			Id:             p.state.device.DeviceId,
+			Name:           p.state.device.Name,
+			Type:           p.state.device.DeviceType.String(),
+			IsActive:       p.state.active,
+			Volume:         vol,
+			SupportsVolume: p.state.device.Capabilities != nil && !p.state.device.Capabilities.DisableVolume,
+		})
+	}
+	return devices
+}
+
+// transferPlayback moves active playback to deviceId using the connect-state
+// transfer endpoint, exactly as spotcontrol does. If play is false the target
+// device receives a "restore" pause option so it stays paused after transfer.
+func (p *AppPlayer) transferPlayback(ctx context.Context, deviceId string, play bool) error {
+	var transferReq *spclient.TransferRequest
+	if !play {
+		restore := "restore"
+		transferReq = &spclient.TransferRequest{
+			TransferOptions: spclient.TransferOptions{
+				RestorePaused: &restore,
+			},
+		}
+	}
+
+	// Determine "from" device — the currently active device in the cluster,
+	// or our own device ID if the cluster is not yet populated.
+	fromDevice := p.app.deviceId
+	p.clusterLock.RLock()
+	if p.cluster != nil && p.cluster.GetActiveDeviceId() != "" {
+		fromDevice = p.cluster.GetActiveDeviceId()
+	}
+	p.clusterLock.RUnlock()
+
+	return p.sess.Spclient().ConnectTransfer(ctx, p.spotConnId, fromDevice, deviceId, transferReq)
 }
 
 func (p *AppPlayer) stopPlayback(ctx context.Context) error {

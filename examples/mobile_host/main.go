@@ -17,7 +17,7 @@ type cb struct {
 	currentName     string // updated on each metadata event
 }
 
-func (c *cb) OnState(event string, payloadJson string) {
+func (c *cb) OnEvent(event string, payloadJson string) {
 	fmt.Printf("[STATE] %s -> %s\n", event, payloadJson)
 	if event == "metadata" {
 		var meta struct {
@@ -60,7 +60,7 @@ func main() {
 
 	// Build a minimal mobile-friendly JSON config
 	cfg := map[string]interface{}{
-		"device_id":      "a80e66172f552359922a3b472a2a30d8a4ef89ee",
+		"device_id":      "c3ad22f78186520b82da064a3da86f1566cbe559",
 		"device_name":    "gomobile-host-sim",
 		"device_type":    "smartphone",
 		"audio_backend":  "oto",
@@ -269,6 +269,42 @@ func main() {
 				fmt.Println("Jump error:", jumpErr)
 			} else {
 				fmt.Println("Jumped to:", chosen.label)
+			}
+		case "devices":
+			fmt.Println(lib.ListDevicesJSON())
+		case "transfer":
+			devicesJSON := lib.ListDevicesJSON()
+			var devices []struct {
+				ID   string `json:"id"`
+				Name string `json:"name"`
+			}
+			if err := json.Unmarshal([]byte(devicesJSON), &devices); err != nil {
+				fmt.Println("Failed parsing devices JSON:", err)
+				break
+			}
+			if len(devices) == 0 {
+				fmt.Println("No available devices to transfer to.")
+				break
+			}
+			deviceLabels := make([]string, len(devices))
+			for i, d := range devices {
+				deviceLabels[i] = fmt.Sprintf("%s (%s)", d.Name, d.ID)
+			}
+			select_ := promptui.Select{
+				Label: "Transfer playback to device",
+				Items: deviceLabels,
+				Size:  len(deviceLabels),
+			}
+			idx, _, err := select_.Run()
+			if err != nil {
+				fmt.Println("Transfer cancelled:", err)
+				break
+			}
+			chosen := devices[idx]
+			if err := lib.TransferPlayback(chosen.ID, true); err != nil {
+				fmt.Println("Transfer error:", err)
+			} else {
+				fmt.Printf("Transfer requested to device: %s (%s)\n", chosen.Name, chosen.ID)
 			}
 		case "bg", "background":
 			if err := lib.OnBackground(); err != nil {

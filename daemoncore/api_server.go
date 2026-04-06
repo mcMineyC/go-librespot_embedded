@@ -72,6 +72,10 @@ const (
 	ApiRequestTypeSetShufflingContext ApiRequestType = "shuffling_context"
 	ApiRequestTypeAddToQueue          ApiRequestType = "add_to_queue"
 	ApiRequestTypeToken               ApiRequestType = "token"
+	ApiRequestTypeTransferPlayback    ApiRequestType = "transfer_playback"
+	ApiRequestTypeGetQueue            ApiRequestType = "get_queue"
+	ApiRequestTypeRemoveFromQueue     ApiRequestType = "remove_from_queue"
+	ApiRequestTypeListDevices         ApiRequestType = "list_devices"
 )
 
 type ApiEventType string
@@ -127,6 +131,15 @@ type ApiRequestDataPlay struct {
 
 type ApiRequestDataNext struct {
 	Uri *string `json:"uri"`
+}
+
+type ApiRequestDataTransferPlayback struct {
+	DeviceId string `json:"device_id"`
+	Play     bool   `json:"play"`
+}
+
+type ApiRequestDataRemoveFromQueue struct {
+	Uri string `json:"uri"`
 }
 
 type apiResponse struct {
