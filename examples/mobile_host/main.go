@@ -18,6 +18,66 @@ type cb struct {
 	currentName     string // updated on each metadata event
 }
 
+type rootLibraryItemResponse struct {
+	URI         string `json:"uri"`
+	Name        string `json:"name"`
+	Description string `json:"description"`
+	ImageURL    string `json:"image_url,omitempty"`
+	Kind        string `json:"kind"`
+}
+
+type libraryEntry struct {
+	URI         string
+	Title       string
+	Description string
+	ImageURL    string
+	Kind        string
+}
+
+func buildLibraryEntries(rootLibraryItemsJSON string) ([]libraryEntry, error) {
+	var items []rootLibraryItemResponse
+	if err := json.Unmarshal([]byte(rootLibraryItemsJSON), &items); err != nil {
+		return nil, fmt.Errorf("failed parsing root library items json: %w", err)
+	}
+
+	entries := make([]libraryEntry, 0, len(items))
+	for _, item := range items {
+		uri := strings.TrimSpace(item.URI)
+		if uri == "" {
+			continue
+		}
+
+		title := strings.TrimSpace(item.Name)
+		if title == "" {
+			title = uri
+		}
+
+		entries = append(entries, libraryEntry{
+			URI:         uri,
+			Title:       title,
+			Description: strings.TrimSpace(item.Description),
+			ImageURL:    strings.TrimSpace(item.ImageURL),
+			Kind:        strings.TrimSpace(item.Kind),
+		})
+	}
+
+	return entries, nil
+}
+
+func formatLibraryEntryLabel(entry libraryEntry) string {
+	base := entry.Title
+	if entry.Description != "" {
+		base = fmt.Sprintf("%s — %s", base, entry.Description)
+	}
+	if entry.Kind != "" {
+		base = fmt.Sprintf("[%s] %s", entry.Kind, base)
+	}
+	if entry.ImageURL != "" {
+		base += " 🖼"
+	}
+	return base
+}
+
 func (c *cb) OnEvent(event string, payloadJson string) {
 	fmt.Printf("[STATE] %s -> %s\n", event, payloadJson)
 	if event == "metadata" {
@@ -55,6 +115,10 @@ const replHelpText = `Available commands:
   setrepeat <mode>  off | context | track
   setshuffle on|off Shuffle for current context
   getmetadata <uri> Fetch metadata for a Spotify URI (track/album/artist/playlist)
+  rootplaylist      Fetch and print the user's root playlist (library root)
+  library           Select item from library rootlist and play
+  libraryjson       Print compact root library payload (includes image_url)
+  search <q> [n]    Search + select result + play (default n=10)
   devices           Print Connect devices from cached cluster (JSON, indented)
   transfer          Choose a device and move playback here (starts playing)
   bg, background    Simulate app background (pause)
@@ -417,6 +481,171 @@ func main() {
 			raw, err := lib.ApiGetMetadataForURI(args[0])
 			if err != nil {
 				fmt.Println("getmetadata error:", err)
+				break
+			}
+			var v any
+			if err := json.Unmarshal([]byte(raw), &v); err != nil {
+				fmt.Println(raw)
+				break
+			}
+			b, err := json.MarshalIndent(v, "", "  ")
+			if err != nil {
+				fmt.Println(raw)
+				break
+			}
+			fmt.Println(string(b))
+		case "search":
+			if len(args) < 1 {
+				fmt.Println("usage: search <query> [limit]")
+				break
+			}
+
+			limit := 10
+			searchArgs := args
+			if len(searchArgs) > 1 {
+				if n, err := strconv.Atoi(searchArgs[len(searchArgs)-1]); err == nil {
+					limit = n
+					searchArgs = searchArgs[:len(searchArgs)-1]
+				}
+			}
+
+			query := strings.TrimSpace(strings.Join(searchArgs, " "))
+			if query == "" {
+				fmt.Println("usage: search <query> [limit]")
+				break
+			}
+
+			raw, err := lib.ApiSearch(query, limit)
+			if err != nil {
+				fmt.Println("search error:", err)
+				break
+			}
+
+			var results []struct {
+				SpotifyID   string `json:"spotify_id"`
+				Title       string `json:"title"`
+				Description string `json:"description"`
+			}
+			if err := json.Unmarshal([]byte(raw), &results); err != nil {
+				fmt.Println(raw)
+				break
+			}
+			if len(results) == 0 {
+				fmt.Println("No search results.")
+				break
+			}
+
+			labels := make([]string, len(results))
+			for i, r := range results {
+				label := r.Title
+				if r.Description != "" {
+					label = fmt.Sprintf("%s — %s", label, r.Description)
+				}
+				if r.SpotifyID != "" {
+					label = fmt.Sprintf("%s (%s)", label, r.SpotifyID)
+				}
+				labels[i] = label
+			}
+
+			size := len(labels)
+			if size > 20 {
+				size = 20
+			}
+
+			select_ := promptui.Select{Label: "Search results", Items: labels, Size: size}
+			idx, _, err := select_.Run()
+			if err != nil {
+				fmt.Println("Search selection cancelled:", err)
+				break
+			}
+
+			chosen := strings.TrimSpace(results[idx].SpotifyID)
+			if chosen == "" {
+				fmt.Println("Chosen result has empty spotify_id")
+				break
+			}
+
+			uri := chosen
+			if !strings.HasPrefix(uri, "spotify:") {
+				uri = "spotify:track:" + uri
+			}
+
+			if err := lib.ApiPlayUri(uri, "", false); err != nil {
+				fmt.Println("search play error:", err)
+			} else {
+				fmt.Println("Playing:", uri)
+			}
+		case "library", "selectroot", "selectlibrary":
+			if len(args) != 0 {
+				fmt.Println("usage: library")
+				break
+			}
+			raw, err := lib.ApiGetRootLibraryItems()
+			if err != nil {
+				fmt.Println("library error:", err)
+				break
+			}
+			entries, err := buildLibraryEntries(raw)
+			if err != nil {
+				fmt.Println("library parse error:", err)
+				break
+			}
+			if len(entries) == 0 {
+				fmt.Println("Library is empty (or no playable rootlist items were returned).")
+				break
+			}
+			labels := make([]string, len(entries))
+			for i, entry := range entries {
+				labels[i] = formatLibraryEntryLabel(entry)
+			}
+			size := len(labels)
+			if size > 20 {
+				size = 20
+			}
+			select_ := promptui.Select{Label: "Select library item to play", Items: labels, Size: size}
+			idx, _, err := select_.Run()
+			if err != nil {
+				fmt.Println("Library selection cancelled:", err)
+				break
+			}
+			chosen := entries[idx]
+			if err := lib.ApiPlayUri(chosen.URI, "", false); err != nil {
+				fmt.Println("library play error:", err)
+			} else {
+				fmt.Printf("Playing: %s (%s)\n", chosen.Title, chosen.URI)
+				if chosen.ImageURL != "" {
+					fmt.Println("Image:", chosen.ImageURL)
+				}
+			}
+		case "libraryjson":
+			if len(args) != 0 {
+				fmt.Println("usage: libraryjson")
+				break
+			}
+			raw, err := lib.ApiGetRootLibraryItems()
+			if err != nil {
+				fmt.Println("libraryjson error:", err)
+				break
+			}
+			var v any
+			if err := json.Unmarshal([]byte(raw), &v); err != nil {
+				fmt.Println(raw)
+				break
+			}
+			b, err := json.MarshalIndent(v, "", "  ")
+			if err != nil {
+				fmt.Println(raw)
+				break
+			}
+			fmt.Println(string(b))
+		case "rootplaylist", "getrootplaylist":
+			if len(args) != 0 {
+				fmt.Println("usage: rootplaylist")
+				break
+			}
+			raw, err := lib.ApiGetRootPlaylist()
+			if err != nil {
+				fmt.Println("rootplaylist error:", err)
 				break
 			}
 			var v any

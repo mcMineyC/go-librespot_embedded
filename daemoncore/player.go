@@ -585,6 +585,32 @@ func (p *AppPlayer) handleApiRequest(ctx context.Context, req ApiRequest) (any, 
 		return nil, p.ApiRemoveFromQueue(data.Uri)
 	case ApiRequestTypeListDevices:
 		return p.ApiListDevices(), nil
+	case ApiRequestTypeSearch:
+		data := req.Data.(ApiRequestDataSearch)
+		raw, err := p.app.Search(ctx, p, data.Query, data.Limit)
+		if err != nil {
+			return nil, err
+		}
+
+		var out any
+		if err := json.Unmarshal([]byte(raw), &out); err != nil {
+			return nil, fmt.Errorf("failed decoding search payload: %w", err)
+		}
+
+		return out, nil
+	case ApiRequestTypeSearchSuggestions:
+		data := req.Data.(ApiRequestDataSearch)
+		raw, err := p.app.SearchSuggestions(ctx, p, data.Query, data.Limit)
+		if err != nil {
+			return nil, err
+		}
+
+		var out any
+		if err := json.Unmarshal([]byte(raw), &out); err != nil {
+			return nil, fmt.Errorf("failed decoding search suggestions payload: %w", err)
+		}
+
+		return out, nil
 	default:
 		return nil, fmt.Errorf("unknown request type: %s", req.Type)
 	}

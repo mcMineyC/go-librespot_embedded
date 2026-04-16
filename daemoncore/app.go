@@ -1,14 +1,17 @@
 package daemoncore
 
 import (
+	"bytes"
 	"context"
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"math"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -21,11 +24,17 @@ import (
 	"github.com/devgianlu/go-librespot/apresolve"
 	"github.com/devgianlu/go-librespot/player"
 	devicespb "github.com/devgianlu/go-librespot/proto/spotify/connectstate/devices"
+	extmetadatapb "github.com/devgianlu/go-librespot/proto/spotify/extendedmetadata"
+	metadatapb "github.com/devgianlu/go-librespot/proto/spotify/metadata"
+	playlist4pb "github.com/devgianlu/go-librespot/proto/spotify/playlist4"
+	yourlibrarypb "github.com/devgianlu/go-librespot/proto/spotify/your_library"
 	"github.com/devgianlu/go-librespot/session"
 	"github.com/devgianlu/go-librespot/zeroconf"
 	"github.com/gofrs/flock"
 	log "github.com/sirupsen/logrus"
 	"golang.org/x/exp/rand"
+	"google.golang.org/protobuf/proto"
+	"google.golang.org/protobuf/types/known/anypb"
 
 	"github.com/knadh/koanf/v2"
 	flag "github.com/spf13/pflag"
@@ -217,6 +226,1076 @@ func (app *App) GetMetadataForURI(ctx context.Context, p *AppPlayer, uri string)
 	}
 
 	return p.sess.Spclient().GetMetadataForURI(ctx, uri)
+}
+
+// SearchResultItem is a compact search result payload returned by Search.
+type SearchResultItem struct {
+	SpotifyID   string `json:"spotify_id"`
+	Title       string `json:"title"`
+	Description string `json:"description,omitempty"`
+}
+
+// SearchSuggestion is a compact suggestion payload returned by SearchSuggestions.
+type SearchSuggestion struct {
+	Suggestion  string `json:"suggestion"`
+	SpotifyID   string `json:"spotify_id,omitempty"`
+	Description string `json:"description,omitempty"`
+}
+
+// RootLibraryItem is a flattened, display-friendly item from the user's root library.
+type RootLibraryItem struct {
+	URI         string `json:"uri"`
+	Title       string `json:"title"`
+	Description string `json:"description,omitempty"`
+	ImageURL    string `json:"image_url,omitempty"`
+}
+
+type rootLibraryMetadata struct {
+	Title       string
+	Description string
+	ImageFileID []byte
+	ImageURL    string
+}
+
+func imageURLFromSpotifyImageURI(imageURI string) string {
+	imageURI = strings.TrimSpace(imageURI)
+	if imageURI == "" {
+		return ""
+	}
+
+	const prefix = "spotify:image:"
+	if strings.HasPrefix(imageURI, prefix) {
+		hexID := strings.TrimSpace(strings.TrimPrefix(imageURI, prefix))
+		if hexID != "" {
+			return "https://i.scdn.co/image/" + hexID
+		}
+	}
+
+	if strings.HasPrefix(imageURI, "https://") || strings.HasPrefix(imageURI, "http://") {
+		return imageURI
+	}
+
+	return ""
+}
+
+func (app *App) buildRootLibraryItemsFromYourLibrary(resp *yourlibrarypb.YourLibraryResponse) []RootLibraryItem {
+	if resp == nil {
+		return []RootLibraryItem{}
+	}
+
+	out := make([]RootLibraryItem, 0, len(resp.GetEntity())+len(resp.GetPinnedEntity()))
+	seen := make(map[string]struct{}, len(resp.GetEntity())+len(resp.GetPinnedEntity()))
+
+	appendEntity := func(e *yourlibrarypb.YourLibraryDecoratedEntity) {
+		if e == nil || e.GetEntityInfo() == nil {
+			return
+		}
+
+		info := e.GetEntityInfo()
+		uri := strings.TrimSpace(info.GetUri())
+		if uri == "" {
+			return
+		}
+
+		if _, ok := seen[uri]; ok {
+			return
+		}
+		seen[uri] = struct{}{}
+
+		title := strings.TrimSpace(info.GetName())
+		if title == "" {
+			title = uri
+		}
+
+		description := strings.TrimSpace(info.GetGroupLabel())
+		if description == "" {
+			if p := e.GetPlaylist(); p != nil {
+				description = strings.TrimSpace(p.GetCreatorName())
+			}
+		}
+
+		out = append(out, RootLibraryItem{
+			URI:         uri,
+			Title:       title,
+			Description: description,
+			ImageURL:    imageURLFromSpotifyImageURI(info.GetImageUri()),
+		})
+	}
+
+	for _, e := range resp.GetEntity() {
+		appendEntity(e)
+	}
+	for _, e := range resp.GetPinnedEntity() {
+		appendEntity(e)
+	}
+
+	return out
+}
+
+func (app *App) getYourLibraryDecorated(ctx context.Context, p *AppPlayer) (*yourlibrarypb.YourLibraryResponse, error) {
+	if app == nil {
+		return nil, fmt.Errorf("app is nil")
+	}
+	if p == nil || p.sess == nil {
+		return nil, fmt.Errorf("player session not initialized")
+	}
+
+	hg := p.sess.Mercury()
+	if hg == nil {
+		return nil, fmt.Errorf("mercury client not initialized")
+	}
+
+	req := &yourlibrarypb.YourLibraryRequest{
+		Header: &yourlibrarypb.YourLibraryRequestHeader{
+			RemainingEntities:       true,
+			TotalCount:              true,
+			Skip:                    0,
+			Length:                  500,
+			AllPlaylists:            true,
+			SeparatePinnedItems:     true,
+			NumLinkTypesInPlaylists: true,
+			IncludeEvents:           true,
+			IncludePrereleases:      true,
+			IncludeAuthors:          true,
+		},
+		UpdateThrottling: 0,
+	}
+
+	body, err := proto.Marshal(req)
+	if err != nil {
+		return nil, fmt.Errorf("failed marshalling your library request: %w", err)
+	}
+
+	candidates := []string{
+		"hm://your-library-view/v1/root",
+		"hm://your-library-view/v1/",
+		"hm://your-library-view/v1",
+	}
+
+	var lastErr error
+	for _, uri := range candidates {
+		respBytes, err := hg.Request(ctx, "POST", uri, nil, body)
+		if err != nil {
+			lastErr = err
+			continue
+		}
+
+		var resp yourlibrarypb.YourLibraryResponse
+		if err := proto.Unmarshal(respBytes, &resp); err != nil {
+			lastErr = fmt.Errorf("failed unmarshalling your library response from %s: %w", uri, err)
+			continue
+		}
+
+		if resp.GetStatusCode() != 0 && resp.GetStatusCode() != 200 {
+			lastErr = fmt.Errorf("your library endpoint %s returned status_code=%d error=%s", uri, resp.GetStatusCode(), resp.GetError())
+			continue
+		}
+
+		if len(resp.GetEntity()) == 0 && len(resp.GetPinnedEntity()) == 0 {
+			lastErr = fmt.Errorf("your library endpoint %s returned no entities", uri)
+			continue
+		}
+
+		app.log.Infof("library metadata pipeline: your-library endpoint %s returned entities=%d pinned=%d", uri, len(resp.GetEntity()), len(resp.GetPinnedEntity()))
+		return &resp, nil
+	}
+
+	if lastErr == nil {
+		lastErr = fmt.Errorf("all your-library endpoints failed")
+	}
+	return nil, lastErr
+}
+
+func stringFromAny(v any) string {
+	s, _ := v.(string)
+	return s
+}
+
+func extractSpotifyIDFromSearchItem(item map[string]any) string {
+	if id := strings.TrimSpace(stringFromAny(item["spotify_id"])); id != "" {
+		return id
+	}
+
+	if id := strings.TrimSpace(stringFromAny(item["id"])); id != "" {
+		return id
+	}
+
+	uri := strings.TrimSpace(stringFromAny(item["uri"]))
+	if uri == "" {
+		return ""
+	}
+
+	parts := strings.Split(uri, ":")
+	if len(parts) == 0 {
+		return ""
+	}
+
+	// keep full spotify URI when present (best for play command)
+	if strings.HasPrefix(uri, "spotify:") {
+		return uri
+	}
+
+	return parts[len(parts)-1]
+}
+
+func extractArtistsSummary(item map[string]any) string {
+	rawArtists, ok := item["artists"].([]any)
+	if !ok || len(rawArtists) == 0 {
+		return ""
+	}
+
+	names := make([]string, 0, len(rawArtists))
+	for _, raw := range rawArtists {
+		artist, ok := raw.(map[string]any)
+		if !ok {
+			continue
+		}
+
+		name := strings.TrimSpace(stringFromAny(artist["name"]))
+		if name == "" {
+			continue
+		}
+
+		names = append(names, name)
+	}
+
+	return strings.Join(names, ", ")
+}
+
+func extractSectionItems(payload map[string]any, section string) []map[string]any {
+	// style 1: Web API-like: payload["tracks"]["items"]
+	if sec, ok := payload[section].(map[string]any); ok {
+		if rawItems, ok := sec["items"].([]any); ok {
+			out := make([]map[string]any, 0, len(rawItems))
+			for _, raw := range rawItems {
+				m, ok := raw.(map[string]any)
+				if ok {
+					out = append(out, m)
+				}
+			}
+			return out
+		}
+	}
+
+	// style 2: searchview-like: payload["results"]["track"]["hits"]
+	if results, ok := payload["results"].(map[string]any); ok {
+		if sec, ok := results[section].(map[string]any); ok {
+			if rawItems, ok := sec["hits"].([]any); ok {
+				out := make([]map[string]any, 0, len(rawItems))
+				for _, raw := range rawItems {
+					m, ok := raw.(map[string]any)
+					if ok {
+						out = append(out, m)
+					}
+				}
+				return out
+			}
+		}
+	}
+
+	return nil
+}
+
+func (app *App) mercurySearch(ctx context.Context, p *AppPlayer, query string, limit int) (map[string]any, error) {
+	if app == nil {
+		return nil, fmt.Errorf("app is nil")
+	}
+	if p == nil || p.sess == nil {
+		return nil, fmt.Errorf("player session not initialized")
+	}
+
+	hg := p.sess.Mercury()
+	if hg == nil {
+		return nil, fmt.Errorf("mercury client not initialized")
+	}
+
+	q := strings.TrimSpace(query)
+	if q == "" {
+		return nil, fmt.Errorf("query must not be empty")
+	}
+
+	if limit <= 0 {
+		limit = 10
+	} else if limit > 50 {
+		limit = 50
+	}
+
+	escapedQuery := url.PathEscape(q)
+	uri := fmt.Sprintf("hm://searchview/km/v4/search/%s?limit=%d&catalogue=from_token&country=from_token", escapedQuery, limit)
+
+	raw, err := hg.Request(ctx, "GET", uri, nil, nil)
+	if err != nil {
+		return nil, fmt.Errorf("failed issuing mercury search request: %w", err)
+	}
+
+	var payload map[string]any
+	if err := json.Unmarshal(raw, &payload); err != nil {
+		return nil, fmt.Errorf("failed decoding mercury search response: %w", err)
+	}
+
+	return payload, nil
+}
+
+// Search performs Mercury-based search and returns compact JSON results.
+func (app *App) Search(ctx context.Context, p *AppPlayer, query string, limit int) (string, error) {
+	payload, err := app.mercurySearch(ctx, p, query, limit)
+	if err != nil {
+		return "", err
+	}
+
+	sections := []string{"track", "album", "artist", "playlist", "show", "episode", "tracks", "albums", "artists", "playlists", "shows", "episodes"}
+	results := make([]SearchResultItem, 0, limit*3)
+	seen := make(map[string]struct{}, limit*3)
+
+	for _, section := range sections {
+		for _, item := range extractSectionItems(payload, section) {
+			id := extractSpotifyIDFromSearchItem(item)
+			if id == "" {
+				continue
+			}
+
+			if _, ok := seen[id]; ok {
+				continue
+			}
+			seen[id] = struct{}{}
+
+			title := strings.TrimSpace(stringFromAny(item["name"]))
+			if title == "" {
+				title = strings.TrimSpace(stringFromAny(item["title"]))
+			}
+			if title == "" {
+				continue
+			}
+
+			description := strings.TrimSpace(stringFromAny(item["description"]))
+			if description == "" {
+				description = extractArtistsSummary(item)
+			}
+
+			results = append(results, SearchResultItem{
+				SpotifyID:   id,
+				Title:       title,
+				Description: description,
+			})
+		}
+	}
+
+	raw, err := json.Marshal(results)
+	if err != nil {
+		return "", fmt.Errorf("failed marshalling search results: %w", err)
+	}
+
+	return string(raw), nil
+}
+
+// SearchSuggestions performs lightweight Mercury search and returns compact JSON suggestions.
+func (app *App) SearchSuggestions(ctx context.Context, p *AppPlayer, query string, limit int) (string, error) {
+	if limit <= 0 {
+		limit = 8
+	} else if limit > 20 {
+		limit = 20
+	}
+
+	payload, err := app.mercurySearch(ctx, p, query, limit)
+	if err != nil {
+		return "", err
+	}
+
+	sections := []string{"track", "artist", "album", "playlist", "show", "episode", "tracks", "artists", "albums", "playlists", "shows", "episodes"}
+	suggestions := make([]SearchSuggestion, 0, limit)
+	seen := make(map[string]struct{}, limit)
+
+outer:
+	for _, section := range sections {
+		for _, item := range extractSectionItems(payload, section) {
+			name := strings.TrimSpace(stringFromAny(item["name"]))
+			if name == "" {
+				name = strings.TrimSpace(stringFromAny(item["title"]))
+			}
+			if name == "" {
+				continue
+			}
+
+			key := strings.ToLower(name)
+			if _, ok := seen[key]; ok {
+				continue
+			}
+			seen[key] = struct{}{}
+
+			description := strings.TrimSpace(stringFromAny(item["description"]))
+			if description == "" {
+				description = extractArtistsSummary(item)
+			}
+
+			suggestions = append(suggestions, SearchSuggestion{
+				Suggestion:  name,
+				SpotifyID:   extractSpotifyIDFromSearchItem(item),
+				Description: description,
+			})
+
+			if len(suggestions) >= limit {
+				break outer
+			}
+		}
+	}
+
+	raw, err := json.Marshal(suggestions)
+	if err != nil {
+		return "", fmt.Errorf("failed marshalling search suggestions: %w", err)
+	}
+
+	return string(raw), nil
+}
+
+// GetRootPlaylist fetches authenticated user's root playlist (library root).
+// Tries decorated endpoint first (official librespot behavior), then falls back to Mercury rootlist.
+func (app *App) GetRootPlaylist(ctx context.Context, p *AppPlayer) (*playlist4pb.SelectedListContent, error) {
+	if app == nil {
+		return nil, fmt.Errorf("app is nil")
+	}
+	if p == nil || p.sess == nil {
+		return nil, fmt.Errorf("player session not initialized")
+	}
+
+	if decorated, err := app.getRootPlaylistDecorated(ctx, p); err == nil {
+		return decorated, nil
+	} else {
+		app.log.Debugf("decorated rootlist unavailable, falling back to mercury: %v", err)
+	}
+
+	hg := p.sess.Mercury()
+	if hg == nil {
+		return nil, fmt.Errorf("mercury client not initialized")
+	}
+
+	username := p.sess.Username()
+	if username == "" {
+		return nil, fmt.Errorf("session username is empty")
+	}
+
+	resp, err := hg.Request(ctx, "GET", fmt.Sprintf("hm://playlist/user/%s/rootlist", username), nil, nil)
+	if err != nil {
+		return nil, fmt.Errorf("failed requesting root playlist: %w", err)
+	}
+
+	var out playlist4pb.SelectedListContent
+	if err := proto.Unmarshal(resp, &out); err != nil {
+		return nil, fmt.Errorf("failed unmarshalling root playlist: %w", err)
+	}
+
+	return &out, nil
+}
+
+func (app *App) getRootPlaylistDecorated(ctx context.Context, p *AppPlayer) (*playlist4pb.SelectedListContent, error) {
+	if p == nil || p.sess == nil {
+		return nil, fmt.Errorf("player session not initialized")
+	}
+	username := p.sess.Username()
+	if username == "" {
+		return nil, fmt.Errorf("session username is empty")
+	}
+
+	resp, err := p.sess.Spclient().Request(
+		ctx,
+		"GET",
+		fmt.Sprintf("/playlist/v2/user/%s/rootlist", username),
+		url.Values{
+			"decorate": {"revision,attributes,length,owner,capabilities,status_code"},
+			"from":     {"0"},
+			"length":   {"500"},
+		},
+		nil,
+		nil,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("failed requesting decorated rootlist: %w", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	raw, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("failed reading decorated rootlist response: %w", err)
+	}
+	if resp.StatusCode != 200 {
+		return nil, fmt.Errorf("decorated rootlist returned %d: %s", resp.StatusCode, string(raw))
+	}
+
+	var out playlist4pb.SelectedListContent
+	if err := proto.Unmarshal(raw, &out); err != nil {
+		return nil, fmt.Errorf("failed unmarshalling decorated rootlist: %w", err)
+	}
+	return &out, nil
+}
+
+// GetRootLibraryItems returns flattened root library entries with uri/title/description/image_url.
+// Includes timing logs for each stage so slow metadata paths are visible.
+func (app *App) GetRootLibraryItems(ctx context.Context, p *AppPlayer) ([]RootLibraryItem, error) {
+	totalStart := time.Now()
+
+	rootFetchStart := time.Now()
+	root, err := app.GetRootPlaylist(ctx, p)
+	if err != nil {
+		app.log.Warnf("library metadata pipeline: rootlist path unavailable, fallback to your-library decorated path: %v", err)
+
+		yourLibraryStart := time.Now()
+		if ylResp, ylErr := app.getYourLibraryDecorated(ctx, p); ylErr == nil {
+			items := app.buildRootLibraryItemsFromYourLibrary(ylResp)
+			app.log.Infof("library metadata pipeline: your-library decorated fallback took %s, items=%d", time.Since(yourLibraryStart), len(items))
+			return items, nil
+		} else {
+			return nil, fmt.Errorf("failed fetching root library via rootlist and your-library fallback: rootlist=%w, your-library=%v", err, ylErr)
+		}
+	}
+	app.log.Infof("library metadata pipeline: rootlist fetch took %s", time.Since(rootFetchStart))
+
+	contents := root.GetContents()
+	if contents == nil {
+		app.log.Infof("library metadata pipeline: rootlist empty, total %s", time.Since(totalStart))
+		return []RootLibraryItem{}, nil
+	}
+
+	items := contents.GetItems()
+	metaItems := contents.GetMetaItems()
+	out := make([]RootLibraryItem, 0, len(items))
+
+	inlineStart := time.Now()
+	missingURIs := make([]string, 0, len(items))
+	seenMissing := make(map[string]struct{}, len(items))
+
+	for i, it := range items {
+		if it == nil {
+			continue
+		}
+		uri := it.GetUri()
+		if uri == "" {
+			continue
+		}
+
+		var title, desc string
+		if i < len(metaItems) && metaItems[i] != nil && metaItems[i].GetAttributes() != nil {
+			attrs := metaItems[i].GetAttributes()
+			title = attrs.GetName()
+			desc = attrs.GetDescription()
+		}
+
+		entry := RootLibraryItem{
+			URI:         uri,
+			Title:       title,
+			Description: desc,
+		}
+
+		if i < len(metaItems) && metaItems[i] != nil && metaItems[i].GetAttributes() != nil {
+			attrs := metaItems[i].GetAttributes()
+			app.applyRootLibraryPictureSizes(&entry, attrs)
+			app.applyRootLibraryImage(&entry, p, attrs.GetPicture())
+		}
+
+		out = append(out, entry)
+
+		needsBatchMetadata := title == "" && shouldAttemptRootLibraryMetadataFallback(uri)
+		if !needsBatchMetadata && strings.HasPrefix(uri, "spotify:playlist:") && entry.ImageURL == "" {
+			needsBatchMetadata = true
+		}
+		if needsBatchMetadata {
+			if _, ok := seenMissing[uri]; !ok {
+				seenMissing[uri] = struct{}{}
+				missingURIs = append(missingURIs, uri)
+			}
+		}
+	}
+	app.log.Infof("library metadata pipeline: inline extraction took %s, items=%d, missing=%d", time.Since(inlineStart), len(out), len(missingURIs))
+
+	batchStart := time.Now()
+	batchMeta, batchErr := app.getBatchedRootLibraryMetadata(ctx, p, missingURIs)
+	if batchErr != nil {
+		app.log.Warnf("library metadata pipeline: extended metadata batch failed after %s: %v", time.Since(batchStart), batchErr)
+		batchMeta = map[string]rootLibraryMetadata{}
+	} else {
+		app.log.Infof("library metadata pipeline: extended metadata batch took %s, resolved=%d, requested=%d", time.Since(batchStart), len(batchMeta), len(missingURIs))
+	}
+
+	for i := range out {
+		if m, ok := batchMeta[out[i].URI]; ok {
+			if out[i].Title == "" {
+				out[i].Title = m.Title
+			}
+			if out[i].Description == "" {
+				out[i].Description = m.Description
+			}
+			if out[i].ImageURL == "" && m.ImageURL != "" {
+				out[i].ImageURL = m.ImageURL
+			}
+			app.applyRootLibraryImage(&out[i], p, m.ImageFileID)
+		}
+	}
+
+	fallbackStart := time.Now()
+	fallbackCalls := 0
+
+	unresolvedBeforeFallback := make([]string, 0, len(out))
+	unresolvedKindsBefore := map[string]int{}
+	for i := range out {
+		if out[i].Title != "" || !shouldAttemptRootLibraryMetadataFallback(out[i].URI) {
+			continue
+		}
+
+		unresolvedBeforeFallback = append(unresolvedBeforeFallback, out[i].URI)
+		kind := "unknown"
+		switch {
+		case strings.HasPrefix(out[i].URI, "spotify:playlist:"):
+			kind = "playlist"
+		case strings.HasPrefix(out[i].URI, "spotify:folder:"):
+			kind = "folder"
+		case strings.HasPrefix(out[i].URI, "spotify:show:"):
+			kind = "show"
+		case strings.HasPrefix(out[i].URI, "spotify:album:"):
+			kind = "album"
+		case strings.HasPrefix(out[i].URI, "spotify:artist:"):
+			kind = "artist"
+		case strings.HasPrefix(out[i].URI, "spotify:track:"):
+			kind = "track"
+		case strings.HasPrefix(out[i].URI, "spotify:episode:"):
+			kind = "episode"
+		case strings.HasPrefix(out[i].URI, "spotify:user:"):
+			kind = "collection"
+		}
+		unresolvedKindsBefore[kind]++
+	}
+
+	if len(unresolvedBeforeFallback) > 0 {
+		sample := unresolvedBeforeFallback
+		if len(sample) > 15 {
+			sample = sample[:15]
+		}
+		app.log.Warnf("library metadata pipeline: unresolved after batch=%d kinds=%v sample=%v", len(unresolvedBeforeFallback), unresolvedKindsBefore, sample)
+	}
+
+	for i := range out {
+		if out[i].Title != "" || !shouldAttemptRootLibraryMetadataFallback(out[i].URI) {
+			continue
+		}
+
+		fallbackCalls++
+		meta, err := p.sess.Spclient().GetMetadataForURI(ctx, out[i].URI)
+		if err == nil {
+			app.applySingleMetadataFallback(&out[i], p, meta)
+		}
+
+		if out[i].Title == "" {
+			out[i].Title = out[i].URI
+		}
+	}
+
+	unresolvedAfterFallback := make([]string, 0, len(out))
+	unresolvedKindsAfter := map[string]int{}
+	for i := range out {
+		if out[i].Title != "" || !shouldAttemptRootLibraryMetadataFallback(out[i].URI) {
+			continue
+		}
+
+		unresolvedAfterFallback = append(unresolvedAfterFallback, out[i].URI)
+		kind := "unknown"
+		switch {
+		case strings.HasPrefix(out[i].URI, "spotify:playlist:"):
+			kind = "playlist"
+		case strings.HasPrefix(out[i].URI, "spotify:folder:"):
+			kind = "folder"
+		case strings.HasPrefix(out[i].URI, "spotify:show:"):
+			kind = "show"
+		case strings.HasPrefix(out[i].URI, "spotify:album:"):
+			kind = "album"
+		case strings.HasPrefix(out[i].URI, "spotify:artist:"):
+			kind = "artist"
+		case strings.HasPrefix(out[i].URI, "spotify:track:"):
+			kind = "track"
+		case strings.HasPrefix(out[i].URI, "spotify:episode:"):
+			kind = "episode"
+		case strings.HasPrefix(out[i].URI, "spotify:user:"):
+			kind = "collection"
+		}
+		unresolvedKindsAfter[kind]++
+	}
+
+	app.log.Infof("library metadata pipeline: per-item fallback took %s, calls=%d", time.Since(fallbackStart), fallbackCalls)
+	if len(unresolvedAfterFallback) > 0 {
+		sample := unresolvedAfterFallback
+		if len(sample) > 15 {
+			sample = sample[:15]
+		}
+		app.log.Warnf("library metadata pipeline: unresolved after fallback=%d kinds=%v sample=%v", len(unresolvedAfterFallback), unresolvedKindsAfter, sample)
+	}
+	app.log.Infof("library metadata pipeline: total took %s", time.Since(totalStart))
+
+	return out, nil
+}
+
+func rootLibraryMetadataQueriesForURI(uri string) []*extmetadatapb.ExtensionQuery {
+	switch {
+	case strings.HasPrefix(uri, "spotify:track:"):
+		return []*extmetadatapb.ExtensionQuery{
+			{ExtensionKind: extmetadatapb.ExtensionKind_TRACK_V4},
+		}
+	case strings.HasPrefix(uri, "spotify:album:"):
+		return []*extmetadatapb.ExtensionQuery{
+			{ExtensionKind: extmetadatapb.ExtensionKind_ALBUM_V4},
+		}
+	case strings.HasPrefix(uri, "spotify:artist:"):
+		return []*extmetadatapb.ExtensionQuery{
+			{ExtensionKind: extmetadatapb.ExtensionKind_ARTIST_V4},
+		}
+	case strings.HasPrefix(uri, "spotify:show:"):
+		return []*extmetadatapb.ExtensionQuery{
+			{ExtensionKind: extmetadatapb.ExtensionKind_SHOW_V4},
+		}
+	case strings.HasPrefix(uri, "spotify:episode:"):
+		return []*extmetadatapb.ExtensionQuery{
+			{ExtensionKind: extmetadatapb.ExtensionKind_EPISODE_V4},
+		}
+	case strings.HasPrefix(uri, "spotify:playlist:"):
+		return []*extmetadatapb.ExtensionQuery{
+			{ExtensionKind: extmetadatapb.ExtensionKind_PLAYLIST_ATTRIBUTES_V2},
+			{ExtensionKind: extmetadatapb.ExtensionKind_LIST_ATTRIBUTES_V2},
+			{ExtensionKind: extmetadatapb.ExtensionKind_LIST_METADATA},
+			{ExtensionKind: extmetadatapb.ExtensionKind_LIST_METADATA_V2},
+			{ExtensionKind: extmetadatapb.ExtensionKind_VISUAL_IDENTITY_TRAIT},
+		}
+	default:
+		return nil
+	}
+}
+
+func shouldAttemptRootLibraryMetadataFallback(uri string) bool {
+	switch {
+	case strings.HasPrefix(uri, "spotify:track:"),
+		strings.HasPrefix(uri, "spotify:album:"),
+		strings.HasPrefix(uri, "spotify:artist:"),
+		strings.HasPrefix(uri, "spotify:show:"),
+		strings.HasPrefix(uri, "spotify:episode:"),
+		strings.HasPrefix(uri, "spotify:playlist:"):
+		return true
+	default:
+		return false
+	}
+}
+
+func (app *App) getBatchedRootLibraryMetadata(ctx context.Context, p *AppPlayer, uris []string) (map[string]rootLibraryMetadata, error) {
+	if p == nil || p.sess == nil {
+		return nil, fmt.Errorf("player session not initialized")
+	}
+	if len(uris) == 0 {
+		return map[string]rootLibraryMetadata{}, nil
+	}
+
+	req := &extmetadatapb.BatchedEntityRequest{
+		EntityRequest: make([]*extmetadatapb.EntityRequest, 0, len(uris)),
+	}
+	for _, uri := range uris {
+		if uri == "" {
+			continue
+		}
+
+		queries := rootLibraryMetadataQueriesForURI(uri)
+		if len(queries) == 0 {
+			continue
+		}
+
+		req.EntityRequest = append(req.EntityRequest, &extmetadatapb.EntityRequest{
+			EntityUri: uri,
+			Query:     queries,
+		})
+	}
+
+	if len(req.EntityRequest) == 0 {
+		return map[string]rootLibraryMetadata{}, nil
+	}
+
+	resp, err := p.sess.Spclient().ExtendedMetadata(ctx, req)
+	if err != nil {
+		return nil, err
+	}
+
+	out := make(map[string]rootLibraryMetadata, len(uris))
+	kindCounts := map[string]int{}
+	statusCounts := map[int32]int{}
+	samples := make([]string, 0, 20)
+
+	for _, arr := range resp.GetExtendedMetadata() {
+		if arr == nil {
+			kindCounts["<nil-array>"]++
+			continue
+		}
+
+		kindKey := arr.GetExtensionKind().String()
+		kindCounts[kindKey] += len(arr.GetExtensionData())
+
+		for _, extData := range arr.GetExtensionData() {
+			if extData == nil {
+				statusCounts[-1]++
+				if len(samples) < cap(samples) {
+					samples = append(samples, fmt.Sprintf("kind=%s uri=<nil> status=-1 type_url=<nil-extData>", kindKey))
+				}
+				continue
+			}
+
+			statusCode := int32(-2)
+			if extData.GetHeader() != nil {
+				statusCode = extData.GetHeader().GetStatusCode()
+			}
+			statusCounts[statusCode]++
+
+			typeURL := "<nil-any>"
+			if extData.GetExtensionData() != nil {
+				typeURL = extData.GetExtensionData().GetTypeUrl()
+			}
+
+			if len(samples) < cap(samples) {
+				samples = append(samples, fmt.Sprintf("kind=%s uri=%s status=%d type_url=%s", kindKey, extData.GetEntityUri(), statusCode, typeURL))
+			}
+
+			if extData.GetExtensionData() == nil {
+				continue
+			}
+			if extData.GetHeader() == nil || extData.GetHeader().GetStatusCode() != 200 {
+				continue
+			}
+
+			uri := extData.GetEntityUri()
+			if uri == "" {
+				continue
+			}
+
+			cur := out[uri]
+			switch arr.GetExtensionKind() {
+			case extmetadatapb.ExtensionKind_TRACK_V4:
+				var m metadatapb.Track
+				if err := extData.GetExtensionData().UnmarshalTo(&m); err == nil {
+					if cur.Title == "" {
+						cur.Title = m.GetName()
+					}
+					if cur.ImageFileID == nil && m.GetAlbum() != nil {
+						cur.ImageFileID = bestImageFileID(m.GetAlbum().GetCoverGroup(), m.GetAlbum().GetCover())
+					}
+				}
+			case extmetadatapb.ExtensionKind_ALBUM_V4:
+				var m metadatapb.Album
+				if err := extData.GetExtensionData().UnmarshalTo(&m); err == nil {
+					if cur.Title == "" {
+						cur.Title = m.GetName()
+					}
+					if cur.ImageFileID == nil {
+						cur.ImageFileID = bestImageFileID(m.GetCoverGroup(), m.GetCover())
+					}
+				}
+			case extmetadatapb.ExtensionKind_ARTIST_V4:
+				var m metadatapb.Artist
+				if err := extData.GetExtensionData().UnmarshalTo(&m); err == nil {
+					if cur.Title == "" {
+						cur.Title = m.GetName()
+					}
+					if cur.ImageFileID == nil {
+						cur.ImageFileID = bestImageFileID(m.GetPortraitGroup(), m.GetPortrait())
+					}
+				}
+			case extmetadatapb.ExtensionKind_SHOW_V4:
+				var m metadatapb.Show
+				if err := extData.GetExtensionData().UnmarshalTo(&m); err == nil {
+					if cur.Title == "" {
+						cur.Title = m.GetName()
+					}
+					if cur.Description == "" {
+						cur.Description = m.GetDescription()
+					}
+					if cur.ImageFileID == nil {
+						cur.ImageFileID = bestImageFileID(m.GetCoverImage(), nil)
+					}
+				}
+			case extmetadatapb.ExtensionKind_EPISODE_V4:
+				var m metadatapb.Episode
+				if err := extData.GetExtensionData().UnmarshalTo(&m); err == nil {
+					if cur.Title == "" {
+						cur.Title = m.GetName()
+					}
+					if cur.Description == "" {
+						cur.Description = m.GetDescription()
+					}
+					if cur.ImageFileID == nil {
+						cur.ImageFileID = bestImageFileID(m.GetCoverImage(), nil)
+					}
+				}
+			case extmetadatapb.ExtensionKind_VISUAL_IDENTITY_TRAIT, extmetadatapb.ExtensionKind_LIST_METADATA_V2:
+				if cur.ImageURL == "" {
+					cur.ImageURL = extractMosaicURLFromAny(extData.GetExtensionData())
+				}
+			}
+
+			if cur.Title != "" || cur.Description != "" || len(cur.ImageFileID) > 0 || cur.ImageURL != "" {
+				out[uri] = cur
+			}
+		}
+	}
+
+	app.log.Infof("library metadata pipeline: extended metadata diagnostics kinds=%v statuses=%v", kindCounts, statusCounts)
+	if len(samples) > 0 {
+		app.log.Warnf("library metadata pipeline: extended metadata sample=%v", samples)
+	}
+
+	return out, nil
+}
+
+func bestImageFileID(group *metadatapb.ImageGroup, direct []*metadatapb.Image) []byte {
+	if group != nil {
+		images := group.GetImage()
+		for i := len(images) - 1; i >= 0; i-- {
+			if images[i] == nil {
+				continue
+			}
+			if fid := images[i].GetFileId(); len(fid) > 0 {
+				return fid
+			}
+		}
+	}
+
+	for i := len(direct) - 1; i >= 0; i-- {
+		if direct[i] == nil {
+			continue
+		}
+		if fid := direct[i].GetFileId(); len(fid) > 0 {
+			return fid
+		}
+	}
+
+	return nil
+}
+
+func (app *App) applyRootLibraryPictureSizes(item *RootLibraryItem, attrs *playlist4pb.ListAttributes) {
+	if item == nil || attrs == nil || item.ImageURL != "" {
+		return
+	}
+
+	bestRank := 999
+	bestURL := ""
+
+	for _, ps := range attrs.GetPictureSize() {
+		if ps == nil {
+			continue
+		}
+
+		u := strings.TrimSpace(ps.GetUrl())
+		if u == "" {
+			continue
+		}
+
+		rank := 100
+		switch strings.ToLower(strings.TrimSpace(ps.GetTargetName())) {
+		case "xlarge":
+			rank = 0
+		case "large":
+			rank = 1
+		case "default":
+			rank = 2
+		case "small":
+			rank = 3
+		}
+
+		if rank < bestRank {
+			bestRank = rank
+			bestURL = u
+		}
+	}
+
+	if bestURL != "" {
+		item.ImageURL = bestURL
+	}
+}
+
+func extractMosaicURLFromAny(v *anypb.Any) string {
+	if v == nil {
+		return ""
+	}
+
+	const prefix = "https://mosaic.scdn.co/"
+	raw := v.GetValue()
+	start := bytes.Index(raw, []byte(prefix))
+	if start < 0 {
+		return ""
+	}
+
+	part := raw[start:]
+	end := len(part)
+	for i := 0; i < len(part); i++ {
+		if part[i] < 0x20 {
+			end = i
+			break
+		}
+	}
+
+	url := strings.TrimSpace(string(part[:end]))
+	if strings.HasPrefix(url, prefix) {
+		return url
+	}
+	return ""
+}
+
+func (app *App) applyRootLibraryImage(item *RootLibraryItem, p *AppPlayer, fileID []byte) {
+	if item == nil || p == nil || p.prodInfo == nil || len(fileID) == 0 || item.ImageURL != "" {
+		return
+	}
+	if img := p.prodInfo.ImageUrl(fileID); img != nil {
+		item.ImageURL = *img
+	}
+}
+
+func (app *App) applySingleMetadataFallback(item *RootLibraryItem, p *AppPlayer, meta any) {
+	if item == nil || meta == nil {
+		return
+	}
+
+	switch m := meta.(type) {
+	case *metadatapb.Track:
+		if item.Title == "" {
+			item.Title = m.GetName()
+		}
+		if m.GetAlbum() != nil {
+			app.applyRootLibraryImage(item, p, bestImageFileID(m.GetAlbum().GetCoverGroup(), m.GetAlbum().GetCover()))
+		}
+	case *metadatapb.Album:
+		if item.Title == "" {
+			item.Title = m.GetName()
+		}
+		app.applyRootLibraryImage(item, p, bestImageFileID(m.GetCoverGroup(), m.GetCover()))
+	case *metadatapb.Artist:
+		if item.Title == "" {
+			item.Title = m.GetName()
+		}
+		app.applyRootLibraryImage(item, p, bestImageFileID(m.GetPortraitGroup(), m.GetPortrait()))
+	case *metadatapb.Show:
+		if item.Title == "" {
+			item.Title = m.GetName()
+		}
+		if item.Description == "" {
+			item.Description = m.GetDescription()
+		}
+		app.applyRootLibraryImage(item, p, bestImageFileID(m.GetCoverImage(), nil))
+	case *metadatapb.Episode:
+		if item.Title == "" {
+			item.Title = m.GetName()
+		}
+		if item.Description == "" {
+			item.Description = m.GetDescription()
+		}
+		app.applyRootLibraryImage(item, p, bestImageFileID(m.GetCoverImage(), nil))
+	case *playlist4pb.SelectedListContent:
+		if m.GetAttributes() != nil {
+			if item.Title == "" {
+				item.Title = m.GetAttributes().GetName()
+			}
+			if item.Description == "" {
+				item.Description = m.GetAttributes().GetDescription()
+			}
+			app.applyRootLibraryPictureSizes(item, m.GetAttributes())
+			app.applyRootLibraryImage(item, p, m.GetAttributes().GetPicture())
+		}
+	}
 }
 
 // RestoreStoredCredentials restores stored session credentials previously serialized

@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"strings"
 	"sync"
 
 	// Use the new stable core package extracted from cmd/daemon.
@@ -537,6 +538,176 @@ func (l *Librespot) ApiGetMetadataForURI(uri string) (string, error) {
 	}
 
 	return string(b), nil
+}
+
+// ApiGetRootPlaylist fetches the authenticated user's root playlist (library root)
+// and returns it as JSON.
+func (l *Librespot) ApiGetRootPlaylist() (string, error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.app == nil || l.player == nil {
+		return "", fmt.Errorf("not started")
+	}
+
+	root, err := l.app.GetRootPlaylist(context.Background(), l.player)
+	if err != nil {
+		return "", err
+	}
+
+	b, err := json.Marshal(root)
+	if err != nil {
+		return "", fmt.Errorf("failed to marshal root playlist: %w", err)
+	}
+
+	return string(b), nil
+}
+
+// GetRootPlaylistJSON is a convenience wrapper around ApiGetRootPlaylist.
+// It returns "{}" if the bridge is not started or if the request fails.
+func (l *Librespot) GetRootPlaylistJSON() string {
+	raw, err := l.ApiGetRootPlaylist()
+	if err != nil {
+		return "{}"
+	}
+	return raw
+}
+
+
+// RootLibraryItem is a lightweight, host-friendly representation of a rootlist
+// entry suitable for selection UIs.
+type RootLibraryItem struct {
+	URI         string `json:"uri"`
+	Name        string `json:"name"`
+	Description string `json:"description"`
+	ImageURL    string `json:"image_url,omitempty"`
+	Kind        string `json:"kind"`
+}
+
+func rootLibraryKindFromURI(uri string) string {
+	switch {
+	case strings.HasPrefix(uri, "spotify:playlist:"):
+		return "playlist"
+	case strings.HasPrefix(uri, "spotify:folder:"):
+		return "folder"
+	case strings.HasPrefix(uri, "spotify:show:"):
+		return "show"
+	case strings.HasPrefix(uri, "spotify:album:"):
+		return "album"
+	case strings.HasPrefix(uri, "spotify:artist:"):
+		return "artist"
+	case strings.HasPrefix(uri, "spotify:user:"):
+		return "collection"
+	default:
+		return "unknown"
+	}
+}
+
+// ApiGetRootLibraryItems fetches authenticated user rootlist and returns compact JSON.
+func (l *Librespot) ApiGetRootLibraryItems() (string, error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.app == nil || l.player == nil {
+		return "", fmt.Errorf("not started")
+	}
+
+	libraryItems, err := l.app.GetRootLibraryItems(context.Background(), l.player)
+	if err != nil {
+		return "", err
+	}
+
+	items := make([]RootLibraryItem, 0, len(libraryItems))
+	for _, it := range libraryItems {
+		if it.URI == "" {
+			continue
+		}
+
+		name := it.Title
+		if name == "" {
+			name = it.URI
+		}
+
+		items = append(items, RootLibraryItem{
+			URI:         it.URI,
+			Name:        name,
+			Description: it.Description,
+			ImageURL:    it.ImageURL,
+			Kind:        rootLibraryKindFromURI(it.URI),
+		})
+	}
+
+	b, err := json.Marshal(items)
+	if err != nil {
+		return "", fmt.Errorf("failed to marshal root library items: %w", err)
+	}
+
+	return string(b), nil
+}
+
+// GetRootLibraryItemsJSON is convenience wrapper around ApiGetRootLibraryItems.
+func (l *Librespot) GetRootLibraryItemsJSON() string {
+	raw, err := l.ApiGetRootLibraryItems()
+	if err != nil {
+		return "[]"
+	}
+	return raw
+}
+
+// ApiSearch performs a Spotify search and returns compact JSON results:
+//
+//	[
+//	  {"spotify_id":"...","title":"...","description":"..."},
+//	  ...
+//	]
+func (l *Librespot) ApiSearch(query string, limit int) (string, error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.app == nil || l.player == nil {
+		return "", fmt.Errorf("not started")
+	}
+	query = strings.TrimSpace(query)
+	if query == "" {
+		return "", fmt.Errorf("query must not be empty")
+	}
+	return l.app.Search(context.Background(), l.player, query, limit)
+}
+
+// Search is a convenience wrapper around ApiSearch.
+// It returns "[]" if the bridge is not started or if the request fails.
+func (l *Librespot) Search(query string, limit int) string {
+	raw, err := l.ApiSearch(query, limit)
+	if err != nil {
+		return "[]"
+	}
+	return raw
+}
+
+// ApiSearchSuggestions returns compact JSON suggestions for type-ahead UIs:
+//
+//	[
+//	  {"suggestion":"...","spotify_id":"...","description":"..."},
+//	  ...
+//	]
+func (l *Librespot) ApiSearchSuggestions(query string, limit int) (string, error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.app == nil || l.player == nil {
+		return "", fmt.Errorf("not started")
+	}
+	query = strings.TrimSpace(query)
+	if query == "" {
+		return "", fmt.Errorf("query must not be empty")
+	}
+	return l.app.SearchSuggestions(context.Background(), l.player, query, limit)
+}
+
+// SearchSuggestions is a convenience wrapper around ApiSearchSuggestions.
+// It returns "[]" if the bridge is not started or if the request fails.
+func (l *Librespot) SearchSuggestions(query string, limit int) string {
+	raw, err := l.ApiSearchSuggestions(query, limit)
+	if err != nil {
+		return "[]"
+	}
+	return raw
 }
 
 // ApiTransferPlaybackCtx moves playback to deviceId using ctx.

@@ -261,8 +261,7 @@ func (c *Spclient) GetMetadataForURI(ctx context.Context, uri string) (any, erro
 		return a, nil
 
 	case TypePlaylist:
-		hexID, _ := Base62ToHex(base62)
-		p, err := c.GetPlaylistContents(ctx, hexID)
+		p, err := c.GetPlaylistContents(ctx, base62)
 		if err != nil {
 			return nil, err
 		}

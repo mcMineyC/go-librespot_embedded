@@ -9,6 +9,7 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -76,6 +77,8 @@ const (
 	ApiRequestTypeGetQueue            ApiRequestType = "get_queue"
 	ApiRequestTypeRemoveFromQueue     ApiRequestType = "remove_from_queue"
 	ApiRequestTypeListDevices         ApiRequestType = "list_devices"
+	ApiRequestTypeSearch              ApiRequestType = "search"
+	ApiRequestTypeSearchSuggestions   ApiRequestType = "search_suggestions"
 )
 
 type ApiEventType string
@@ -140,6 +143,11 @@ type ApiRequestDataTransferPlayback struct {
 
 type ApiRequestDataRemoveFromQueue struct {
 	Uri string `json:"uri"`
+}
+
+type ApiRequestDataSearch struct {
+	Query string `json:"query"`
+	Limit int    `json:"limit"`
 }
 
 type apiResponse struct {
@@ -621,6 +629,60 @@ func (s *ConcreteApiServer) serve() {
 		}
 
 		s.handleRequest(ApiRequest{Type: ApiRequestTypeToken}, w)
+	})
+	m.HandleFunc("/search", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != "GET" {
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			return
+		}
+
+		query := strings.TrimSpace(r.URL.Query().Get("q"))
+		if query == "" {
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+
+		limit := 10
+		if rawLimit := strings.TrimSpace(r.URL.Query().Get("limit")); rawLimit != "" {
+			n, err := strconv.Atoi(rawLimit)
+			if err != nil || n <= 0 {
+				w.WriteHeader(http.StatusBadRequest)
+				return
+			}
+			limit = n
+		}
+
+		s.handleRequest(ApiRequest{
+			Type: ApiRequestTypeSearch,
+			Data: ApiRequestDataSearch{Query: query, Limit: limit},
+		}, w)
+	})
+	m.HandleFunc("/searchsuggestions", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != "GET" {
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			return
+		}
+
+		query := strings.TrimSpace(r.URL.Query().Get("q"))
+		if query == "" {
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+
+		limit := 8
+		if rawLimit := strings.TrimSpace(r.URL.Query().Get("limit")); rawLimit != "" {
+			n, err := strconv.Atoi(rawLimit)
+			if err != nil || n <= 0 {
+				w.WriteHeader(http.StatusBadRequest)
+				return
+			}
+			limit = n
+		}
+
+		s.handleRequest(ApiRequest{
+			Type: ApiRequestTypeSearchSuggestions,
+			Data: ApiRequestDataSearch{Query: query, Limit: limit},
+		}, w)
 	})
 	m.HandleFunc("/events", func(w http.ResponseWriter, r *http.Request) {
 		opts := &websocket.AcceptOptions{}
