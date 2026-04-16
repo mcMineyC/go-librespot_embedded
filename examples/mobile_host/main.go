@@ -54,6 +54,7 @@ const replHelpText = `Available commands:
   setvolume <n>     Set volume step (0 .. volume_steps from config)
   setrepeat <mode>  off | context | track
   setshuffle on|off Shuffle for current context
+  getmetadata <uri> Fetch metadata for a Spotify URI (track/album/artist/playlist)
   devices           Print Connect devices from cached cluster (JSON, indented)
   transfer          Choose a device and move playback here (starts playing)
   bg, background    Simulate app background (pause)
@@ -408,6 +409,27 @@ func main() {
 			} else {
 				fmt.Printf("Shuffle: %v\n", on)
 			}
+		case "getmetadata":
+			if len(args) < 1 {
+				fmt.Println("usage: getmetadata <uri>")
+				break
+			}
+			raw, err := lib.ApiGetMetadataForURI(args[0])
+			if err != nil {
+				fmt.Println("getmetadata error:", err)
+				break
+			}
+			var v any
+			if err := json.Unmarshal([]byte(raw), &v); err != nil {
+				fmt.Println(raw)
+				break
+			}
+			b, err := json.MarshalIndent(v, "", "  ")
+			if err != nil {
+				fmt.Println(raw)
+				break
+			}
+			fmt.Println(string(b))
 		case "jump":
 			if len(args) != 0 {
 				fmt.Println("usage: jump")

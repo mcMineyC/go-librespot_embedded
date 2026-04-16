@@ -517,6 +517,28 @@ func (l *Librespot) ApiListDevices() []DeviceInfo {
 	return out
 }
 
+// ApiGetMetadataForURI resolves metadata for a Spotify URI and returns it as JSON.
+// The response shape depends on URI type (track/album/artist/playlist).
+func (l *Librespot) ApiGetMetadataForURI(uri string) (string, error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.app == nil || l.player == nil {
+		return "", fmt.Errorf("not started")
+	}
+
+	meta, err := l.app.GetMetadataForURI(context.Background(), l.player, uri)
+	if err != nil {
+		return "", err
+	}
+
+	b, err := json.Marshal(meta)
+	if err != nil {
+		return "", fmt.Errorf("failed to marshal metadata: %w", err)
+	}
+
+	return string(b), nil
+}
+
 // ApiTransferPlaybackCtx moves playback to deviceId using ctx.
 func (l *Librespot) ApiTransferPlaybackCtx(ctx context.Context, deviceId string, play bool) error {
 	l.mu.Lock()

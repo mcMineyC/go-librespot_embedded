@@ -202,6 +202,23 @@ func (app *App) DumpStateJSON() ([]byte, error) {
 	return app.state.DumpToJSON()
 }
 
+// GetMetadataForURI resolves Spotify metadata for the given URI by delegating
+// to the current session Spclient. Supported URI types mirror
+// spclient.GetMetadataForURI (track, album, artist, playlist).
+func (app *App) GetMetadataForURI(ctx context.Context, p *AppPlayer, uri string) (any, error) {
+	if app == nil {
+		return nil, fmt.Errorf("app is nil")
+	}
+	if p == nil || p.sess == nil {
+		return nil, fmt.Errorf("player session not initialized")
+	}
+	if uri == "" {
+		return nil, fmt.Errorf("uri must not be empty")
+	}
+
+	return p.sess.Spclient().GetMetadataForURI(ctx, uri)
+}
+
 // RestoreStoredCredentials restores stored session credentials previously serialized
 // by the host or saved in state.json. The function accepts a JSON string which may
 // be in one of the following forms:
