@@ -611,6 +611,19 @@ func (p *AppPlayer) handleApiRequest(ctx context.Context, req ApiRequest) (any, 
 		}
 
 		return out, nil
+	case ApiRequestTypeRecentSearches:
+		data := req.Data.(ApiRequestDataSearch)
+		raw, err := p.app.RecentSearches(ctx, p, data.Limit)
+		if err != nil {
+			return nil, err
+		}
+
+		var out any
+		if err := json.Unmarshal([]byte(raw), &out); err != nil {
+			return nil, fmt.Errorf("failed decoding recent searches payload: %w", err)
+		}
+
+		return out, nil
 	default:
 		return nil, fmt.Errorf("unknown request type: %s", req.Type)
 	}

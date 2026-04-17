@@ -215,7 +215,7 @@ func (l *Librespot) StartWithConfigJSON(configJSON string, cb EventCallback) err
 	}
 
 	l.started = true
-	l.dispatchLog("info", "librespot started")
+	//l.dispatchLog("info", "librespot started")
 	return nil
 }
 
@@ -572,7 +572,6 @@ func (l *Librespot) GetRootPlaylistJSON() string {
 	return raw
 }
 
-
 // RootLibraryItem is a lightweight, host-friendly representation of a rootlist
 // entry suitable for selection UIs.
 type RootLibraryItem struct {
@@ -704,6 +703,31 @@ func (l *Librespot) ApiSearchSuggestions(query string, limit int) (string, error
 // It returns "[]" if the bridge is not started or if the request fails.
 func (l *Librespot) SearchSuggestions(query string, limit int) string {
 	raw, err := l.ApiSearchSuggestions(query, limit)
+	if err != nil {
+		return "[]"
+	}
+	return raw
+}
+
+// ApiRecentSearches returns compact JSON recent-search entities:
+//
+//	[
+//	  {"title":"...","spotify_id":"...","description":"...","kind":"..."},
+//	  ...
+//	]
+func (l *Librespot) ApiRecentSearches(limit int) (string, error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.app == nil || l.player == nil {
+		return "", fmt.Errorf("not started")
+	}
+	return l.app.RecentSearches(context.Background(), l.player, limit)
+}
+
+// RecentSearches is a convenience wrapper around ApiRecentSearches.
+// It returns "[]" if the bridge is not started or if the request fails.
+func (l *Librespot) RecentSearches(limit int) string {
+	raw, err := l.ApiRecentSearches(limit)
 	if err != nil {
 		return "[]"
 	}

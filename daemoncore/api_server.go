@@ -79,6 +79,7 @@ const (
 	ApiRequestTypeListDevices         ApiRequestType = "list_devices"
 	ApiRequestTypeSearch              ApiRequestType = "search"
 	ApiRequestTypeSearchSuggestions   ApiRequestType = "search_suggestions"
+	ApiRequestTypeRecentSearches      ApiRequestType = "recent_searches"
 )
 
 type ApiEventType string
@@ -682,6 +683,27 @@ func (s *ConcreteApiServer) serve() {
 		s.handleRequest(ApiRequest{
 			Type: ApiRequestTypeSearchSuggestions,
 			Data: ApiRequestDataSearch{Query: query, Limit: limit},
+		}, w)
+	})
+	m.HandleFunc("/recentsearches", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != "GET" {
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			return
+		}
+
+		limit := 20
+		if rawLimit := strings.TrimSpace(r.URL.Query().Get("limit")); rawLimit != "" {
+			n, err := strconv.Atoi(rawLimit)
+			if err != nil || n <= 0 {
+				w.WriteHeader(http.StatusBadRequest)
+				return
+			}
+			limit = n
+		}
+
+		s.handleRequest(ApiRequest{
+			Type: ApiRequestTypeRecentSearches,
+			Data: ApiRequestDataSearch{Limit: limit},
 		}, w)
 	})
 	m.HandleFunc("/events", func(w http.ResponseWriter, r *http.Request) {

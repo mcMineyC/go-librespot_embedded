@@ -19,6 +19,15 @@ type AppState struct {
 		Username string `json:"username"`
 		Data     []byte `json:"data"`
 	} `json:"credentials"`
+	WebAPICredentials struct {
+		AccessToken  string `json:"access_token,omitempty"`
+		RefreshToken string `json:"refresh_token,omitempty"`
+		TokenType    string `json:"token_type,omitempty"`
+		ExpiresAt    int64  `json:"expires_at,omitempty"`
+		Scope        string `json:"scope,omitempty"`
+		ClientID     string `json:"client_id,omitempty"`
+		ClientSecret string `json:"client_secret,omitempty"`
+	} `json:"web_api_credentials"`
 	LastVolume *uint32 `json:"last_volume"`
 }
 

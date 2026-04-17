@@ -15,6 +15,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	librespot "github.com/devgianlu/go-librespot"
@@ -77,7 +78,16 @@ type App struct {
 	deviceId    string
 	deviceType  devicespb.DeviceType
 	clientToken string
-	state       librespot.AppState
+
+	// Web API OAuth manager
+	webAPIClientID       string
+	webAPIClientSecret   string
+	webAPIRefreshToken   string
+	webAPIAccessToken    string
+	webAPIAccessTokenExp time.Time
+	webAPITokenLock      sync.RWMutex
+
+	state librespot.AppState
 
 	server   ApiServer
 	mpris    mpris.Server
@@ -123,6 +133,32 @@ func NewApp(cfg *Config) (app *App, err error) {
 		}
 	}
 
+	// Initialize Web API credential manager from config first.
+	app.webAPIClientID = strings.TrimSpace(cfg.Credentials.WebAPI.ClientID)
+	app.webAPIClientSecret = strings.TrimSpace(cfg.Credentials.WebAPI.ClientSecret)
+	app.webAPIRefreshToken = strings.TrimSpace(cfg.Credentials.WebAPI.RefreshToken)
+	app.webAPIAccessToken = strings.TrimSpace(cfg.Credentials.WebAPI.AccessToken)
+	if cfg.Credentials.WebAPI.ExpiresAt > 0 {
+		app.webAPIAccessTokenExp = time.Unix(cfg.Credentials.WebAPI.ExpiresAt, 0)
+	}
+
+	// Then hydrate missing values from persisted app state (if present).
+	if app.webAPIClientID == "" {
+		app.webAPIClientID = strings.TrimSpace(app.state.WebAPICredentials.ClientID)
+	}
+	if app.webAPIClientSecret == "" {
+		app.webAPIClientSecret = strings.TrimSpace(app.state.WebAPICredentials.ClientSecret)
+	}
+	if app.webAPIRefreshToken == "" {
+		app.webAPIRefreshToken = strings.TrimSpace(app.state.WebAPICredentials.RefreshToken)
+	}
+	if app.webAPIAccessToken == "" {
+		app.webAPIAccessToken = strings.TrimSpace(app.state.WebAPICredentials.AccessToken)
+	}
+	if app.webAPIAccessTokenExp.IsZero() && app.state.WebAPICredentials.ExpiresAt > 0 {
+		app.webAPIAccessTokenExp = time.Unix(app.state.WebAPICredentials.ExpiresAt, 0)
+	}
+
 	/* Deprecated in faor of passing in persisted state from the host:
 	if err := app.state.Read(cfg.ConfigDir); err != nil {
 		return nil, err
@@ -141,7 +177,7 @@ func NewApp(cfg *Config) (app *App, err error) {
 		deviceIdBytes := make([]byte, 20)
 		_, _ = rand.Read(deviceIdBytes)
 		app.deviceId = hex.EncodeToString(deviceIdBytes)
-		log.Infof("generated new device id: %s", app.deviceId)
+		log.Debugf("generated new device id: %s", app.deviceId)
 
 		// Save device ID so we can reuse it next time.
 		app.state.DeviceId = app.deviceId
@@ -181,6 +217,29 @@ func (app *App) SetCredentialPersistCallback(cb CredentialPersistCallback) {
 	app.credentialPersistCb = cb
 }
 
+// SetWebAPICredentials configures OAuth client id/secret and refresh token
+// to support full Web API access_token refresh flow. Calling this will
+// clear any cached access token and cause the daemon to refresh on next use.
+func (app *App) SetWebAPICredentials(clientID, clientSecret, refreshToken string) {
+	if app == nil {
+		return
+	}
+	app.webAPITokenLock.Lock()
+	defer app.webAPITokenLock.Unlock()
+	app.webAPIClientID = strings.TrimSpace(clientID)
+	app.webAPIClientSecret = strings.TrimSpace(clientSecret)
+	app.webAPIRefreshToken = strings.TrimSpace(refreshToken)
+	app.webAPIAccessToken = ""
+	app.webAPIAccessTokenExp = time.Time{}
+
+	// Keep persisted app state in sync with in-memory Web API credential manager.
+	app.state.WebAPICredentials.ClientID = app.webAPIClientID
+	app.state.WebAPICredentials.ClientSecret = app.webAPIClientSecret
+	app.state.WebAPICredentials.RefreshToken = app.webAPIRefreshToken
+	app.state.WebAPICredentials.AccessToken = ""
+	app.state.WebAPICredentials.ExpiresAt = 0
+}
+
 // LoadStateJSON loads persisted state provided by the embedding application.
 // The host application (embedding this library) is responsible for reading
 // persisted bytes from disk or secure storage and passing them here.
@@ -197,6 +256,28 @@ func (app *App) LoadStateJSON(data []byte) error {
 	if err := app.state.LoadFromJSON(data); err != nil {
 		return fmt.Errorf("failed loading state json: %w", err)
 	}
+
+	// Hydrate in-memory Web API credential manager from loaded persisted state.
+	app.webAPITokenLock.Lock()
+	defer app.webAPITokenLock.Unlock()
+
+	if v := strings.TrimSpace(app.state.WebAPICredentials.ClientID); v != "" {
+		app.webAPIClientID = v
+	}
+	if v := strings.TrimSpace(app.state.WebAPICredentials.ClientSecret); v != "" {
+		app.webAPIClientSecret = v
+	}
+	if v := strings.TrimSpace(app.state.WebAPICredentials.RefreshToken); v != "" {
+		app.webAPIRefreshToken = v
+	}
+
+	app.webAPIAccessToken = strings.TrimSpace(app.state.WebAPICredentials.AccessToken)
+	if app.state.WebAPICredentials.ExpiresAt > 0 {
+		app.webAPIAccessTokenExp = time.Unix(app.state.WebAPICredentials.ExpiresAt, 0)
+	} else {
+		app.webAPIAccessTokenExp = time.Time{}
+	}
+
 	return nil
 }
 
@@ -240,6 +321,14 @@ type SearchSuggestion struct {
 	Suggestion  string `json:"suggestion"`
 	SpotifyID   string `json:"spotify_id,omitempty"`
 	Description string `json:"description,omitempty"`
+}
+
+// RecentSearchItem is a compact recent-search payload returned by RecentSearches.
+type RecentSearchItem struct {
+	Title       string `json:"title"`
+	SpotifyID   string `json:"spotify_id,omitempty"`
+	Description string `json:"description,omitempty"`
+	Kind        string `json:"kind,omitempty"`
 }
 
 // RootLibraryItem is a flattened, display-friendly item from the user's root library.
@@ -391,7 +480,7 @@ func (app *App) getYourLibraryDecorated(ctx context.Context, p *AppPlayer) (*you
 			return nil, fmt.Errorf("your library endpoint %s via %s returned no entities", uri, source)
 		}
 
-		app.log.Infof("library metadata pipeline: your-library endpoint %s via %s returned entities=%d pinned=%d", uri, source, len(resp.GetEntity()), len(resp.GetPinnedEntity()))
+		app.log.Debugf("library metadata pipeline: your-library endpoint %s via %s returned entities=%d pinned=%d", uri, source, len(resp.GetEntity()), len(resp.GetPinnedEntity()))
 		return &resp, nil
 	}
 
@@ -583,8 +672,271 @@ func (app *App) mercurySearch(ctx context.Context, p *AppPlayer, query string, l
 	return payload, nil
 }
 
-// Search performs Mercury-based search and returns compact JSON results.
-func (app *App) Search(ctx context.Context, p *AppPlayer, query string, limit int) (string, error) {
+const (
+	pathfinderSearchOperationName            = "searchDesktop"
+	pathfinderSearchOperationHash            = "21b3fe49546912ba782db5c47e9ef5a7dbd20329520ba0c7d0fcfadee671d24e"
+	pathfinderSearchSuggestionsOperationName = "searchSuggestions"
+	pathfinderSearchSuggestionsOperationHash = "1b44e7bced744d15c47e6c4c11952541693324020c528dc97d19c4a38cfb754e"
+	pathfinderRecentSearchesOperationName    = "recentSearches"
+	pathfinderRecentSearchesOperationHash    = "873c63d8337500d59512c3dc80f47d1b1ab4f12c94fae8136c6a3103e1c976a5"
+)
+
+func asMap(v any) map[string]any {
+	m, _ := v.(map[string]any)
+	return m
+}
+
+func asSlice(v any) []any {
+	s, _ := v.([]any)
+	return s
+}
+
+func pathLookupMap(m map[string]any, path ...string) map[string]any {
+	cur := any(m)
+	for _, k := range path {
+		mm, ok := cur.(map[string]any)
+		if !ok {
+			return nil
+		}
+		cur, ok = mm[k]
+		if !ok {
+			return nil
+		}
+	}
+	out, _ := cur.(map[string]any)
+	return out
+}
+
+func pathLookupSlice(m map[string]any, path ...string) []any {
+	cur := any(m)
+	for _, k := range path {
+		mm, ok := cur.(map[string]any)
+		if !ok {
+			return nil
+		}
+		cur, ok = mm[k]
+		if !ok {
+			return nil
+		}
+	}
+	out, _ := cur.([]any)
+	return out
+}
+
+func unwrapPathfinderEntity(raw any) map[string]any {
+	cur := asMap(raw)
+	if cur == nil {
+		return nil
+	}
+
+	for {
+		if inner := asMap(cur["item"]); inner != nil {
+			cur = inner
+			continue
+		}
+		if inner := asMap(cur["data"]); inner != nil {
+			cur = inner
+			continue
+		}
+		break
+	}
+
+	return cur
+}
+
+func extractPathfinderArtists(ent map[string]any) string {
+	artists := pathLookupSlice(ent, "artists", "items")
+	if len(artists) == 0 {
+		return ""
+	}
+
+	names := make([]string, 0, len(artists))
+	for _, raw := range artists {
+		am := asMap(raw)
+		if am == nil {
+			continue
+		}
+		if profile := asMap(am["profile"]); profile != nil {
+			if n := strings.TrimSpace(stringFromAny(profile["name"])); n != "" {
+				names = append(names, n)
+				continue
+			}
+		}
+		if n := strings.TrimSpace(stringFromAny(am["name"])); n != "" {
+			names = append(names, n)
+		}
+	}
+	return strings.Join(names, ", ")
+}
+
+func extractPathfinderAuthors(ent map[string]any) string {
+	authors := asSlice(ent["authorsV2"])
+	if len(authors) == 0 {
+		return ""
+	}
+	names := make([]string, 0, len(authors))
+	for _, raw := range authors {
+		am := asMap(raw)
+		if am == nil {
+			continue
+		}
+		if n := strings.TrimSpace(stringFromAny(am["name"])); n != "" {
+			names = append(names, n)
+		}
+	}
+	return strings.Join(names, ", ")
+}
+
+func extractPathfinderID(ent map[string]any) string {
+	if ent == nil {
+		return ""
+	}
+
+	uri := strings.TrimSpace(stringFromAny(ent["uri"]))
+	if uri != "" {
+		return uri
+	}
+
+	if id := strings.TrimSpace(stringFromAny(ent["id"])); id != "" {
+		return id
+	}
+
+	return ""
+}
+
+func extractPathfinderTitle(ent map[string]any) string {
+	if ent == nil {
+		return ""
+	}
+
+	if s := strings.TrimSpace(stringFromAny(ent["name"])); s != "" {
+		return s
+	}
+	if s := strings.TrimSpace(stringFromAny(ent["title"])); s != "" {
+		return s
+	}
+	if prof := asMap(ent["profile"]); prof != nil {
+		if s := strings.TrimSpace(stringFromAny(prof["name"])); s != "" {
+			return s
+		}
+	}
+	if s := strings.TrimSpace(stringFromAny(ent["displayName"])); s != "" {
+		return s
+	}
+	if s := strings.TrimSpace(stringFromAny(ent["text"])); s != "" {
+		return s
+	}
+
+	return ""
+}
+
+func extractPathfinderDescription(ent map[string]any) string {
+	if ent == nil {
+		return ""
+	}
+
+	if s := strings.TrimSpace(stringFromAny(ent["description"])); s != "" {
+		return s
+	}
+	if s := extractPathfinderArtists(ent); s != "" {
+		return s
+	}
+	if owner := pathLookupMap(ent, "ownerV2", "data"); owner != nil {
+		if s := strings.TrimSpace(stringFromAny(owner["name"])); s != "" {
+			return s
+		}
+	}
+	if publisher := asMap(ent["publisher"]); publisher != nil {
+		if s := strings.TrimSpace(stringFromAny(publisher["name"])); s != "" {
+			return s
+		}
+	}
+	if s := extractPathfinderAuthors(ent); s != "" {
+		return s
+	}
+	if s := strings.TrimSpace(stringFromAny(ent["username"])); s != "" {
+		return s
+	}
+
+	return ""
+}
+
+func extractPathfinderKind(ent map[string]any) string {
+	if ent == nil {
+		return ""
+	}
+	return strings.TrimSpace(stringFromAny(ent["__typename"]))
+}
+
+func (app *App) pathfinderQuery(ctx context.Context, p *AppPlayer, operationName, operationHash string, variables map[string]any) (map[string]any, error) {
+	if app == nil {
+		return nil, fmt.Errorf("app is nil")
+	}
+	if p == nil || p.sess == nil {
+		return nil, fmt.Errorf("player session not initialized")
+	}
+
+	// For testing: use session Spclient token handling directly.
+	accessToken, err := p.sess.Spclient().GetAccessToken(ctx, false)
+	if err != nil {
+		return nil, fmt.Errorf("failed getting access token for web api: %w", err)
+	}
+
+	bodyObj := map[string]any{
+		"variables":     variables,
+		"operationName": operationName,
+		"extensions": map[string]any{
+			"persistedQuery": map[string]any{
+				"version":    1,
+				"sha256Hash": operationHash,
+			},
+		},
+	}
+
+	body, err := json.Marshal(bodyObj)
+	if err != nil {
+		return nil, fmt.Errorf("failed marshalling pathfinder request: %w", err)
+	}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, "https://api-partner.spotify.com/pathfinder/v2/query", bytes.NewReader(body))
+	if err != nil {
+		return nil, fmt.Errorf("failed creating pathfinder request: %w", err)
+	}
+
+	req.Header.Set("Accept", "application/json")
+	req.Header.Set("Content-Type", "application/json;charset=UTF-8")
+	req.Header.Set("Authorization", fmt.Sprintf("Bearer %s", accessToken))
+	//req.Header.Set("Origin", "https://xpui.app.spotify.com")
+	//req.Header.Set("Referer", "https://xpui.app.spotify.com/")
+	req.Header.Set("User-Agent", librespot.UserAgent())
+	if app.clientToken != "" {
+		req.Header.Set("client-token", app.clientToken)
+	}
+
+	resp, err := app.client.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("pathfinder request failed: %w", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	raw, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("failed reading pathfinder response: %w", err)
+	}
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("pathfinder returned status %d: %s", resp.StatusCode, string(raw))
+	}
+
+	var payload map[string]any
+	if err := json.Unmarshal(raw, &payload); err != nil {
+		return nil, fmt.Errorf("failed decoding pathfinder response: %w", err)
+	}
+
+	return payload, nil
+}
+
+func (app *App) searchFromMercury(ctx context.Context, p *AppPlayer, query string, limit int) (string, error) {
 	payload, err := app.mercurySearch(ctx, p, query, limit)
 	if err != nil {
 		return "", err
@@ -635,14 +987,7 @@ func (app *App) Search(ctx context.Context, p *AppPlayer, query string, limit in
 	return string(raw), nil
 }
 
-// SearchSuggestions performs lightweight Mercury search and returns compact JSON suggestions.
-func (app *App) SearchSuggestions(ctx context.Context, p *AppPlayer, query string, limit int) (string, error) {
-	if limit <= 0 {
-		limit = 8
-	} else if limit > 20 {
-		limit = 20
-	}
-
+func (app *App) searchSuggestionsFromMercury(ctx context.Context, p *AppPlayer, query string, limit int) (string, error) {
 	payload, err := app.mercurySearch(ctx, p, query, limit)
 	if err != nil {
 		return "", err
@@ -689,6 +1034,243 @@ outer:
 	raw, err := json.Marshal(suggestions)
 	if err != nil {
 		return "", fmt.Errorf("failed marshalling search suggestions: %w", err)
+	}
+
+	return string(raw), nil
+}
+
+// Search performs Pathfinder-based search and falls back to Mercury search.
+func (app *App) Search(ctx context.Context, p *AppPlayer, query string, limit int) (string, error) {
+	if limit <= 0 {
+		limit = 10
+	} else if limit > 50 {
+		limit = 50
+	}
+
+	vars := map[string]any{
+		"searchTerm":                     strings.TrimSpace(query),
+		"offset":                         0,
+		"limit":                          limit,
+		"numberOfTopResults":             5,
+		"includeAudiobooks":              true,
+		"includeArtistHasConcertsField":  false,
+		"includePreReleases":             true,
+		"includeAuthors":                 true,
+		"includeEpisodeContentRatingsV2": false,
+	}
+
+	payload, err := app.pathfinderQuery(ctx, p, pathfinderSearchOperationName, pathfinderSearchOperationHash, vars)
+	if err == nil {
+		searchV2 := pathLookupMap(payload, "data", "searchV2")
+		if searchV2 != nil {
+			sections := []string{
+				"topResultsV2.itemsV2",
+				"tracksV2.items",
+				"albumsV2.items",
+				"artists.items",
+				"playlists.items",
+				"podcasts.items",
+				"episodes.items",
+				"audiobooks.items",
+				"users.items",
+			}
+
+			results := make([]SearchResultItem, 0, limit*2)
+			seen := make(map[string]struct{}, limit*2)
+
+			appendEntity := func(raw any) {
+				ent := unwrapPathfinderEntity(raw)
+				if ent == nil {
+					return
+				}
+
+				id := extractPathfinderID(ent)
+				title := extractPathfinderTitle(ent)
+				if title == "" {
+					return
+				}
+				if strings.HasPrefix(id, "spotify:search:") {
+					return
+				}
+
+				key := strings.ToLower(strings.TrimSpace(id))
+				if key == "" {
+					key = strings.ToLower(strings.TrimSpace(title))
+				}
+				if key == "" {
+					return
+				}
+				if _, ok := seen[key]; ok {
+					return
+				}
+				seen[key] = struct{}{}
+
+				results = append(results, SearchResultItem{
+					SpotifyID:   id,
+					Title:       title,
+					Description: extractPathfinderDescription(ent),
+				})
+			}
+
+			for _, section := range sections {
+				path := strings.Split(section, ".")
+				rawItems := pathLookupSlice(searchV2, path...)
+				for _, raw := range rawItems {
+					appendEntity(raw)
+					if len(results) >= limit {
+						break
+					}
+				}
+				if len(results) >= limit {
+					break
+				}
+			}
+
+			if len(results) > 0 {
+				raw, merr := json.Marshal(results)
+				if merr == nil {
+					return string(raw), nil
+				}
+			}
+		}
+	} else if app.log != nil {
+		app.log.Errorf("pathfinder search failed, using mercury fallback: %v", err)
+	}
+
+	return app.searchFromMercury(ctx, p, query, limit)
+}
+
+// SearchSuggestions performs Pathfinder suggestions and falls back to Mercury suggestions.
+func (app *App) SearchSuggestions(ctx context.Context, p *AppPlayer, query string, limit int) (string, error) {
+	if limit <= 0 {
+		limit = 8
+	} else if limit > 30 {
+		limit = 30
+	}
+
+	vars := map[string]any{
+		"query":                          strings.TrimSpace(query),
+		"limit":                          limit,
+		"numberOfTopResults":             limit,
+		"offset":                         0,
+		"includeAuthors":                 true,
+		"includeEpisodeContentRatingsV2": false,
+	}
+
+	payload, err := app.pathfinderQuery(ctx, p, pathfinderSearchSuggestionsOperationName, pathfinderSearchSuggestionsOperationHash, vars)
+	if err == nil {
+		searchV2 := pathLookupMap(payload, "data", "searchV2")
+		top := pathLookupSlice(searchV2, "topResultsV2", "itemsV2")
+
+		suggestions := make([]SearchSuggestion, 0, limit)
+		seen := make(map[string]struct{}, limit)
+
+		for _, raw := range top {
+			ent := unwrapPathfinderEntity(raw)
+			if ent == nil {
+				continue
+			}
+
+			suggestion := extractPathfinderTitle(ent)
+			if suggestion == "" {
+				continue
+			}
+
+			key := strings.ToLower(strings.TrimSpace(suggestion))
+			if _, ok := seen[key]; ok {
+				continue
+			}
+			seen[key] = struct{}{}
+
+			suggestions = append(suggestions, SearchSuggestion{
+				Suggestion:  suggestion,
+				SpotifyID:   extractPathfinderID(ent),
+				Description: extractPathfinderDescription(ent),
+			})
+
+			if len(suggestions) >= limit {
+				break
+			}
+		}
+
+		if len(suggestions) > 0 {
+			raw, merr := json.Marshal(suggestions)
+			if merr == nil {
+				return string(raw), nil
+			}
+		}
+	} else if app.log != nil {
+		app.log.Debugf("pathfinder search suggestions failed, using mercury fallback: %v", err)
+	}
+
+	if limit > 20 {
+		limit = 20
+	}
+	return app.searchSuggestionsFromMercury(ctx, p, query, limit)
+}
+
+// RecentSearches returns compact JSON recent-search entities from Pathfinder.
+func (app *App) RecentSearches(ctx context.Context, p *AppPlayer, limit int) (string, error) {
+	if limit <= 0 {
+		limit = 20
+	} else if limit > 50 {
+		limit = 50
+	}
+
+	vars := map[string]any{
+		"limit":                          limit,
+		"includeAuthors":                 true,
+		"includeEpisodeContentRatingsV2": false,
+	}
+
+	payload, err := app.pathfinderQuery(ctx, p, pathfinderRecentSearchesOperationName, pathfinderRecentSearchesOperationHash, vars)
+	if err != nil {
+		return "", err
+	}
+
+	items := pathLookupSlice(payload, "data", "recentSearches", "recentSearchesItems", "items")
+	out := make([]RecentSearchItem, 0, len(items))
+	seen := make(map[string]struct{}, len(items))
+
+	for _, raw := range items {
+		ent := unwrapPathfinderEntity(raw)
+		if ent == nil {
+			continue
+		}
+
+		title := extractPathfinderTitle(ent)
+		if title == "" {
+			continue
+		}
+
+		id := extractPathfinderID(ent)
+		key := strings.ToLower(strings.TrimSpace(id))
+		if key == "" {
+			key = strings.ToLower(strings.TrimSpace(title))
+		}
+		if key == "" {
+			continue
+		}
+		if _, ok := seen[key]; ok {
+			continue
+		}
+		seen[key] = struct{}{}
+
+		out = append(out, RecentSearchItem{
+			Title:       title,
+			SpotifyID:   id,
+			Description: extractPathfinderDescription(ent),
+			Kind:        extractPathfinderKind(ent),
+		})
+
+		if len(out) >= limit {
+			break
+		}
+	}
+
+	raw, err := json.Marshal(out)
+	if err != nil {
+		return "", fmt.Errorf("failed marshalling recent searches: %w", err)
 	}
 
 	return string(raw), nil
@@ -787,17 +1369,17 @@ func (app *App) GetRootLibraryItems(ctx context.Context, p *AppPlayer) ([]RootLi
 		yourLibraryStart := time.Now()
 		if ylResp, ylErr := app.getYourLibraryDecorated(ctx, p); ylErr == nil {
 			items := app.buildRootLibraryItemsFromYourLibrary(ylResp)
-			app.log.Infof("library metadata pipeline: your-library decorated fallback took %s, items=%d", time.Since(yourLibraryStart), len(items))
+			app.log.Debugf("library metadata pipeline: your-library decorated fallback took %s, items=%d", time.Since(yourLibraryStart), len(items))
 			return items, nil
 		} else {
 			return nil, fmt.Errorf("failed fetching root library via rootlist and your-library fallback: rootlist=%w, your-library=%v", err, ylErr)
 		}
 	}
-	app.log.Infof("library metadata pipeline: rootlist fetch took %s", time.Since(rootFetchStart))
+	app.log.Debugf("library metadata pipeline: rootlist fetch took %s", time.Since(rootFetchStart))
 
 	contents := root.GetContents()
 	if contents == nil {
-		app.log.Infof("library metadata pipeline: rootlist empty, total %s", time.Since(totalStart))
+		app.log.Debugf("library metadata pipeline: rootlist empty, total %s", time.Since(totalStart))
 		return []RootLibraryItem{}, nil
 	}
 
@@ -858,7 +1440,7 @@ func (app *App) GetRootLibraryItems(ctx context.Context, p *AppPlayer) ([]RootLi
 			}
 		}
 	}
-	app.log.Infof("library metadata pipeline: inline extraction took %s, items=%d, missing=%d", time.Since(inlineStart), len(out), len(missingURIs))
+	app.log.Debugf("library metadata pipeline: inline extraction took %s, items=%d, missing=%d", time.Since(inlineStart), len(out), len(missingURIs))
 
 	batchStart := time.Now()
 	batchMeta, batchErr := app.getBatchedRootLibraryMetadata(ctx, p, missingURIs)
@@ -866,7 +1448,7 @@ func (app *App) GetRootLibraryItems(ctx context.Context, p *AppPlayer) ([]RootLi
 		app.log.Warnf("library metadata pipeline: extended metadata batch failed after %s: %v", time.Since(batchStart), batchErr)
 		batchMeta = map[string]rootLibraryMetadata{}
 	} else {
-		app.log.Infof("library metadata pipeline: extended metadata batch took %s, resolved=%d, requested=%d", time.Since(batchStart), len(batchMeta), len(missingURIs))
+		app.log.Debugf("library metadata pipeline: extended metadata batch took %s, resolved=%d, requested=%d", time.Since(batchStart), len(batchMeta), len(missingURIs))
 	}
 
 	for i := range out {
@@ -971,7 +1553,7 @@ func (app *App) GetRootLibraryItems(ctx context.Context, p *AppPlayer) ([]RootLi
 		unresolvedKindsAfter[kind]++
 	}
 
-	app.log.Infof("library metadata pipeline: per-item fallback took %s, calls=%d", time.Since(fallbackStart), fallbackCalls)
+	app.log.Debugf("library metadata pipeline: per-item fallback took %s, calls=%d", time.Since(fallbackStart), fallbackCalls)
 	if len(unresolvedAfterFallback) > 0 {
 		sample := unresolvedAfterFallback
 		if len(sample) > 15 {
@@ -980,7 +1562,7 @@ func (app *App) GetRootLibraryItems(ctx context.Context, p *AppPlayer) ([]RootLi
 		app.log.Warnf("library metadata pipeline: unresolved after fallback=%d kinds=%v sample=%v", len(unresolvedAfterFallback), unresolvedKindsAfter, sample)
 	}
 
-	app.log.Infof("library metadata pipeline: total took %s", time.Since(totalStart))
+	app.log.Debugf("library metadata pipeline: total took %s", time.Since(totalStart))
 
 	return out, nil
 }
@@ -1260,7 +1842,7 @@ func (app *App) getBatchedRootLibraryMetadata(ctx context.Context, p *AppPlayer,
 		}
 	}
 
-	app.log.Infof("library metadata pipeline: extended metadata diagnostics kinds=%v statuses=%v", kindCounts, statusCounts)
+	app.log.Debugf("library metadata pipeline: extended metadata diagnostics kinds=%v statuses=%v", kindCounts, statusCounts)
 	if len(samples) > 0 {
 		app.log.Warnf("library metadata pipeline: extended metadata sample=%v", samples)
 	}
@@ -1451,7 +2033,7 @@ func (app *App) newAppPlayer(ctx context.Context, creds any) (_ *AppPlayer, err 
 	appPlayer.prefetchTimer = time.NewTimer(math.MaxInt64)
 	appPlayer.prefetchTimer.Stop()
 
-	fmt.Printf("Creds type: %T", creds)
+	fmt.Printf("Creds type: %T\n", creds)
 	if appPlayer.sess, err = session.NewSessionFromOptions(ctx, &session.Options{
 		Log:         app.log,
 		DeviceType:  app.deviceType,
@@ -1558,7 +2140,7 @@ func (app *App) Zeroconf(ctx context.Context) error {
 	return app.withAppPlayer(ctx, func(ctx context.Context) (*AppPlayer, error) {
 		if app.cfg.Credentials.Zeroconf.PersistCredentials && len(app.state.Credentials.Data) > 0 {
 			app.log.WithField("username", librespot.ObfuscateUsername(app.state.Credentials.Username)).
-				Infof("loading previously persisted zeroconf credentials")
+				Debugf("loading previously persisted zeroconf credentials")
 			return app.newAppPlayer(ctx, session.StoredCredentials{
 				Username: app.state.Credentials.Username,
 				Data:     app.state.Credentials.Data,
@@ -1599,9 +2181,27 @@ func (app *App) withCredentials(ctx context.Context, creds any) (err error) {
 			// If callback is set, the host is responsible for persisting credentials;
 			// we do not write state.json in this case.
 			if app.credentialPersistCb != nil {
+				app.webAPITokenLock.RLock()
+				webAccessToken := app.webAPIAccessToken
+				webRefreshToken := app.webAPIRefreshToken
+				webClientID := app.webAPIClientID
+				webClientSecret := app.webAPIClientSecret
+				webExpiresAt := int64(0)
+				if !app.webAPIAccessTokenExp.IsZero() {
+					webExpiresAt = app.webAPIAccessTokenExp.Unix()
+				}
+				app.webAPITokenLock.RUnlock()
+
 				credsJson, _ := json.Marshal(map[string]interface{}{
 					"username": app.state.Credentials.Username,
 					"data":     app.state.Credentials.Data,
+					"web_api_credentials": map[string]interface{}{
+						"access_token":  webAccessToken,
+						"refresh_token": webRefreshToken,
+						"client_id":     webClientID,
+						"client_secret": webClientSecret,
+						"expires_at":    webExpiresAt,
+					},
 				})
 				if err := app.credentialPersistCb(app.state.Credentials.Username, string(credsJson)); err != nil {
 					app.log.WithError(err).Warn("credential persist callback failed")
@@ -1814,14 +2414,21 @@ type Config struct {
 		ImageSize string `koanf:"image_size"`
 	} `koanf:"server"`
 	Credentials struct {
-		Type        string `koanf:"type"`
+		Type        string `koanf:"type"` // auth type: interactive | spotify_token | zeroconf
 		Interactive struct {
-			CallbackPort int `koanf:"callback_port"`
+			CallbackPort int `koanf:"callback_port"` // local OAuth callback port
 		} `koanf:"interactive"`
 		SpotifyToken struct {
-			Username string `koanf:"username"`
-			Data     string `koanf:"data"`
+			Username string `koanf:"username"` // username for spotify token auth
+			Data     string `koanf:"data"`     // spotify token or encoded persisted data (host-defined)
 		} `koanf:"spotify_token"`
+		WebAPI struct {
+			ClientID     string `koanf:"client_id"`     // OAuth client_id used for Web API token refresh
+			ClientSecret string `koanf:"client_secret"` // OAuth client_secret used for Web API token refresh
+			AccessToken  string `koanf:"access_token"`  // current Web API bearer token
+			RefreshToken string `koanf:"refresh_token"` // refresh token used to mint new Web API access tokens
+			ExpiresAt    int64  `koanf:"expires_at"`    // unix timestamp (seconds) when access_token expires
+		} `koanf:"web_api"`
 		Zeroconf struct {
 			PersistCredentials bool `koanf:"persist_credentials"`
 		} `koanf:"zeroconf"`

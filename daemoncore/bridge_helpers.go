@@ -279,12 +279,35 @@ func (a *App) CompleteInteractiveAuth(ctx context.Context, callbackURL string) e
 		return fmt.Errorf("failed exchanging oauth2 code: %w", err)
 	}
 
-	// Extract username if present and create a session using spotify token flow.
+	// Extract username and Web API token payload from OAuth exchange.
 	usernameVal := token.Extra("username")
 	username, _ := usernameVal.(string)
+	scopeVal := token.Extra("scope")
+	scope, _ := scopeVal.(string)
 
-	// Initialize session using spotify token credentials (this persists credentials
-	// similar to the CLI interactive flow).
+	// Seed in-memory Web API credential manager from interactive auth first.
+	// This drives the credential callback payload produced by withCredentials.
+	a.SetWebAPICredentials(librespot.ClientIdHex, "", token.RefreshToken)
+	a.webAPITokenLock.Lock()
+	a.webAPIAccessToken = token.AccessToken
+	if !token.Expiry.IsZero() {
+		a.webAPIAccessTokenExp = token.Expiry
+	}
+
+	// Persist Web API credentials in app state so host persistence paths
+	// (DumpStateJSON / credential callback payload) capture them.
+	a.state.WebAPICredentials.AccessToken = token.AccessToken
+	a.state.WebAPICredentials.RefreshToken = token.RefreshToken
+	a.state.WebAPICredentials.TokenType = "Bearer"
+	a.state.WebAPICredentials.Scope = scope
+	a.state.WebAPICredentials.ClientID = librespot.ClientIdHex
+	if !token.Expiry.IsZero() {
+		a.state.WebAPICredentials.ExpiresAt = token.Expiry.Unix()
+	}
+	a.webAPITokenLock.Unlock()
+
+	// Initialize session using spotify token credentials (this persists stored
+	// session credentials similar to the CLI interactive flow).
 	if err := a.withCredentials(ctx, session.SpotifyTokenCredentials{Username: username, Token: token.AccessToken}); err != nil {
 		return fmt.Errorf("failed creating session from spotify token: %w", err)
 	}
@@ -297,8 +320,12 @@ func (a *App) CompleteInteractiveAuth(ctx context.Context, callbackURL string) e
 
 // OAuthCredentials contains the credentials obtained from OAuth flow
 type OAuthCredentials struct {
-	Username    string `json:"username"`
-	AccessToken string `json:"access_token"`
+	Username     string `json:"username"`
+	AccessToken  string `json:"access_token"`
+	RefreshToken string `json:"refresh_token,omitempty"`
+	TokenType    string `json:"token_type,omitempty"`
+	ExpiresAt    int64  `json:"expires_at,omitempty"`
+	Scope        string `json:"scope,omitempty"`
 }
 
 // CompleteInteractiveAuthAndReturnCredentials is like CompleteInteractiveAuth but
@@ -353,12 +380,35 @@ func (a *App) CompleteInteractiveAuthAndReturnCredentials(ctx context.Context, c
 		return nil, fmt.Errorf("failed exchanging oauth2 code: %w", err)
 	}
 
-	// Extract username if present and create a session using spotify token flow.
+	// Extract username and Web API token payload from OAuth exchange.
 	usernameVal := token.Extra("username")
 	username, _ := usernameVal.(string)
+	scopeVal := token.Extra("scope")
+	scope, _ := scopeVal.(string)
 
-	// Initialize session using spotify token credentials (this persists credentials
-	// similar to the CLI interactive flow).
+	// Seed in-memory Web API credential manager from interactive auth first.
+	// This drives the credential callback payload produced by withCredentials.
+	a.SetWebAPICredentials(librespot.ClientIdHex, "", token.RefreshToken)
+	a.webAPITokenLock.Lock()
+	a.webAPIAccessToken = token.AccessToken
+	if !token.Expiry.IsZero() {
+		a.webAPIAccessTokenExp = token.Expiry
+	}
+
+	// Persist Web API credentials in app state so host persistence paths
+	// (DumpStateJSON / credential callback payload) capture them.
+	a.state.WebAPICredentials.AccessToken = token.AccessToken
+	a.state.WebAPICredentials.RefreshToken = token.RefreshToken
+	a.state.WebAPICredentials.TokenType = "Bearer"
+	a.state.WebAPICredentials.Scope = scope
+	a.state.WebAPICredentials.ClientID = librespot.ClientIdHex
+	if !token.Expiry.IsZero() {
+		a.state.WebAPICredentials.ExpiresAt = token.Expiry.Unix()
+	}
+	a.webAPITokenLock.Unlock()
+
+	// Initialize session using spotify token credentials (this persists stored
+	// session credentials similar to the CLI interactive flow).
 	if err := a.withCredentials(ctx, session.SpotifyTokenCredentials{Username: username, Token: token.AccessToken}); err != nil {
 		return nil, fmt.Errorf("failed creating session from spotify token: %w", err)
 	}
@@ -366,8 +416,15 @@ func (a *App) CompleteInteractiveAuthAndReturnCredentials(ctx context.Context, c
 	// Cleanup pending entry
 	pendingAuths.Delete(state)
 
-	return &OAuthCredentials{
-		Username:    username,
-		AccessToken: token.AccessToken,
-	}, nil
+	out := &OAuthCredentials{
+		Username:     username,
+		AccessToken:  token.AccessToken,
+		RefreshToken: token.RefreshToken,
+		TokenType:    "Bearer",
+		Scope:        scope,
+	}
+	if !token.Expiry.IsZero() {
+		out.ExpiresAt = token.Expiry.Unix()
+	}
+	return out, nil
 }

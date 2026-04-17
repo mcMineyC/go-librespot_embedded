@@ -118,7 +118,11 @@ const replHelpText = `Available commands:
   rootplaylist      Fetch and print the user's root playlist (library root)
   library           Select item from library rootlist and play
   libraryjson       Print compact root library payload (includes image_url)
-  search <q> [n]    Search + select result + play (default n=10)
+  search <q> [n]    Finalized search + select result + play (default n=10)
+  searchsuggestions <q> [n]
+                    Type-ahead suggestions (default n=8)
+  recentsearches [n]
+                    Recent searches (default n=20)
   devices           Print Connect devices from cached cluster (JSON, indented)
   transfer          Choose a device and move playback here (starts playing)
   bg, background    Simulate app background (pause)
@@ -222,7 +226,7 @@ func main() {
 		os.Exit(1)
 	}
 
-	fmt.Println("librespot started (shim).")
+	fmt.Println("librespot started")
 
 	// Try to restore persisted credentials
 
@@ -575,6 +579,77 @@ func main() {
 			} else {
 				fmt.Println("Playing:", uri)
 			}
+		case "searchsuggestions":
+			if len(args) < 1 {
+				fmt.Println("usage: searchsuggestions <query> [limit]")
+				break
+			}
+
+			limit := 8
+			searchArgs := args
+			if len(searchArgs) > 1 {
+				if n, err := strconv.Atoi(searchArgs[len(searchArgs)-1]); err == nil {
+					limit = n
+					searchArgs = searchArgs[:len(searchArgs)-1]
+				}
+			}
+
+			query := strings.TrimSpace(strings.Join(searchArgs, " "))
+			if query == "" {
+				fmt.Println("usage: searchsuggestions <query> [limit]")
+				break
+			}
+
+			raw, err := lib.ApiSearchSuggestions(query, limit)
+			if err != nil {
+				fmt.Println("searchsuggestions error:", err)
+				break
+			}
+
+			var v any
+			if err := json.Unmarshal([]byte(raw), &v); err != nil {
+				fmt.Println(raw)
+				break
+			}
+			b, err := json.MarshalIndent(v, "", "  ")
+			if err != nil {
+				fmt.Println(raw)
+				break
+			}
+			fmt.Println(string(b))
+		case "recentsearches":
+			if len(args) > 1 {
+				fmt.Println("usage: recentsearches [limit]")
+				break
+			}
+
+			limit := 20
+			if len(args) == 1 {
+				n, err := strconv.Atoi(args[0])
+				if err != nil || n <= 0 {
+					fmt.Println("usage: recentsearches [limit]")
+					break
+				}
+				limit = n
+			}
+
+			raw, err := lib.ApiRecentSearches(limit)
+			if err != nil {
+				fmt.Println("recentsearches error:", err)
+				break
+			}
+
+			var v any
+			if err := json.Unmarshal([]byte(raw), &v); err != nil {
+				fmt.Println(raw)
+				break
+			}
+			b, err := json.MarshalIndent(v, "", "  ")
+			if err != nil {
+				fmt.Println(raw)
+				break
+			}
+			fmt.Println(string(b))
 		case "library", "selectroot", "selectlibrary":
 			if len(args) != 0 {
 				fmt.Println("usage: library")
