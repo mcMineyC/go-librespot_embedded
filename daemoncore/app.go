@@ -347,10 +347,13 @@ func (app *App) getYourLibraryDecorated(ctx context.Context, p *AppPlayer) (*you
 
 	req := &yourlibrarypb.YourLibraryRequest{
 		Header: &yourlibrarypb.YourLibraryRequestHeader{
-			RemainingEntities:       true,
-			TotalCount:              true,
-			Skip:                    0,
-			Length:                  500,
+			RemainingEntities: true,
+			TotalCount:        true,
+			Skip:              0,
+			Length:            500,
+			SortOrder: &yourlibrarypb.YourLibrarySortOrder{
+				SortOrder: yourlibrarypb.YourLibrarySortOrder_RECENTLY_PLAYED_OR_ADDED,
+			},
 			AllPlaylists:            true,
 			SeparatePinnedItems:     true,
 			NumLinkTypesInPlaylists: true,
@@ -373,31 +376,75 @@ func (app *App) getYourLibraryDecorated(ctx context.Context, p *AppPlayer) (*you
 	}
 
 	var lastErr error
-	for _, uri := range candidates {
-		respBytes, err := hg.Request(ctx, "POST", uri, nil, body)
-		if err != nil {
-			lastErr = err
-			continue
-		}
 
+	tryDecode := func(uri string, source string, respBytes []byte) (*yourlibrarypb.YourLibraryResponse, error) {
 		var resp yourlibrarypb.YourLibraryResponse
 		if err := proto.Unmarshal(respBytes, &resp); err != nil {
-			lastErr = fmt.Errorf("failed unmarshalling your library response from %s: %w", uri, err)
-			continue
+			return nil, fmt.Errorf("failed unmarshalling your library response from %s via %s: %w", uri, source, err)
 		}
 
 		if resp.GetStatusCode() != 0 && resp.GetStatusCode() != 200 {
-			lastErr = fmt.Errorf("your library endpoint %s returned status_code=%d error=%s", uri, resp.GetStatusCode(), resp.GetError())
-			continue
+			return nil, fmt.Errorf("your library endpoint %s via %s returned status_code=%d error=%s", uri, source, resp.GetStatusCode(), resp.GetError())
 		}
 
 		if len(resp.GetEntity()) == 0 && len(resp.GetPinnedEntity()) == 0 {
-			lastErr = fmt.Errorf("your library endpoint %s returned no entities", uri)
+			return nil, fmt.Errorf("your library endpoint %s via %s returned no entities", uri, source)
+		}
+
+		app.log.Infof("library metadata pipeline: your-library endpoint %s via %s returned entities=%d pinned=%d", uri, source, len(resp.GetEntity()), len(resp.GetPinnedEntity()))
+		return &resp, nil
+	}
+
+	for _, uri := range candidates {
+		respBytes, err := hg.Request(ctx, "POST", uri, nil, body)
+		if err == nil {
+			if resp, decodeErr := tryDecode(uri, "mercury", respBytes); decodeErr == nil {
+				return resp, nil
+			} else {
+				lastErr = decodeErr
+				continue
+			}
+		}
+
+		lastErr = err
+		if !strings.Contains(err.Error(), "status code: 404") {
 			continue
 		}
 
-		app.log.Infof("library metadata pipeline: your-library endpoint %s returned entities=%d pinned=%d", uri, len(resp.GetEntity()), len(resp.GetPinnedEntity()))
-		return &resp, nil
+		path := "/" + strings.TrimLeft(strings.TrimPrefix(uri, "hm://"), "/")
+		httpResp, reqErr := p.sess.Spclient().Request(
+			ctx,
+			"POST",
+			path,
+			nil,
+			http.Header{
+				"Accept":       {"application/protobuf"},
+				"Content-Type": {"application/protobuf"},
+			},
+			body,
+		)
+		if reqErr != nil {
+			lastErr = fmt.Errorf("your-library spclient fallback request failed for %s: %w", uri, reqErr)
+			continue
+		}
+
+		raw, readErr := io.ReadAll(httpResp.Body)
+		_ = httpResp.Body.Close()
+		if readErr != nil {
+			lastErr = fmt.Errorf("failed reading your-library spclient fallback response for %s: %w", uri, readErr)
+			continue
+		}
+
+		if httpResp.StatusCode != 200 {
+			lastErr = fmt.Errorf("your-library spclient fallback endpoint %s returned %d: %s", uri, httpResp.StatusCode, string(raw))
+			continue
+		}
+
+		if resp, decodeErr := tryDecode(uri, "spclient-fallback", raw); decodeErr == nil {
+			return resp, nil
+		} else {
+			lastErr = decodeErr
+		}
 	}
 
 	if lastErr == nil {
@@ -756,6 +803,7 @@ func (app *App) GetRootLibraryItems(ctx context.Context, p *AppPlayer) ([]RootLi
 
 	items := contents.GetItems()
 	metaItems := contents.GetMetaItems()
+	metaAttrsByURI := buildRootlistMetaAttributesByURIHints(metaItems)
 	out := make([]RootLibraryItem, 0, len(items))
 
 	inlineStart := time.Now()
@@ -771,9 +819,17 @@ func (app *App) GetRootLibraryItems(ctx context.Context, p *AppPlayer) ([]RootLi
 			continue
 		}
 
+		attrs := metaAttrsByURI[uri]
+		if attrs == nil && i < len(metaItems) && metaItems[i] != nil && metaItems[i].GetAttributes() != nil {
+			candidate := metaItems[i].GetAttributes()
+			hint := rootlistMetaURIHint(candidate)
+			if hint == "" || hint == uri {
+				attrs = candidate
+			}
+		}
+
 		var title, desc string
-		if i < len(metaItems) && metaItems[i] != nil && metaItems[i].GetAttributes() != nil {
-			attrs := metaItems[i].GetAttributes()
+		if attrs != nil {
 			title = attrs.GetName()
 			desc = attrs.GetDescription()
 		}
@@ -784,8 +840,7 @@ func (app *App) GetRootLibraryItems(ctx context.Context, p *AppPlayer) ([]RootLi
 			Description: desc,
 		}
 
-		if i < len(metaItems) && metaItems[i] != nil && metaItems[i].GetAttributes() != nil {
-			attrs := metaItems[i].GetAttributes()
+		if attrs != nil {
 			app.applyRootLibraryPictureSizes(&entry, attrs)
 			app.applyRootLibraryImage(&entry, p, attrs.GetPicture())
 		}
@@ -924,9 +979,80 @@ func (app *App) GetRootLibraryItems(ctx context.Context, p *AppPlayer) ([]RootLi
 		}
 		app.log.Warnf("library metadata pipeline: unresolved after fallback=%d kinds=%v sample=%v", len(unresolvedAfterFallback), unresolvedKindsAfter, sample)
 	}
+
 	app.log.Infof("library metadata pipeline: total took %s", time.Since(totalStart))
 
 	return out, nil
+}
+
+func normalizeRootlistMetaURIHint(v string) string {
+	v = strings.TrimSpace(v)
+	if v == "" {
+		return ""
+	}
+
+	if strings.HasPrefix(v, "spotify:playlist:") {
+		return v
+	}
+
+	if strings.HasPrefix(v, "spotify:user:") && strings.Contains(v, ":playlist:") {
+		parts := strings.Split(v, ":")
+		if len(parts) > 0 {
+			last := strings.TrimSpace(parts[len(parts)-1])
+			if last != "" {
+				return "spotify:playlist:" + last
+			}
+		}
+	}
+
+	return v
+}
+
+func rootlistMetaURIHint(attrs *playlist4pb.ListAttributes) string {
+	if attrs == nil {
+		return ""
+	}
+
+	for _, fa := range attrs.GetFormatAttributes() {
+		if fa == nil {
+			continue
+		}
+
+		key := strings.ToLower(strings.TrimSpace(fa.GetKey()))
+		val := normalizeRootlistMetaURIHint(fa.GetValue())
+		if val == "" {
+			continue
+		}
+
+		switch key {
+		case "uri", "wrapped.globaluri", "wrapped.global_uri", "globaluri", "global_uri":
+			return val
+		}
+	}
+
+	return ""
+}
+
+func buildRootlistMetaAttributesByURIHints(metaItems []*playlist4pb.MetaItem) map[string]*playlist4pb.ListAttributes {
+	out := make(map[string]*playlist4pb.ListAttributes, len(metaItems))
+
+	for _, mi := range metaItems {
+		if mi == nil || mi.GetAttributes() == nil {
+			continue
+		}
+
+		attrs := mi.GetAttributes()
+		uriHint := rootlistMetaURIHint(attrs)
+		if uriHint == "" {
+			continue
+		}
+
+		if _, exists := out[uriHint]; !exists {
+			out[uriHint] = attrs
+		}
+	}
+
+	return out
 }
 
 func rootLibraryMetadataQueriesForURI(uri string) []*extmetadatapb.ExtensionQuery {
