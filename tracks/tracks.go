@@ -350,3 +350,102 @@ func (tl *List) ToggleShuffle(ctx context.Context, shuffle bool) error {
 		}
 	}
 }
+
+// InsertIntoQueue inserts track into the user queue at index, where 0 means
+// "play next". Out of range indexes are clamped.
+func (tl *List) InsertIntoQueue(index int, track *connectpb.ContextTrack) {
+	if track.Metadata == nil {
+		track.Metadata = make(map[string]string)
+	}
+	track.Metadata["is_queued"] = "true"
+
+	// The currently playing queue item (if any) stays at tl.queue[0].
+	offset := 0
+	if tl.playingQueue {
+		offset = 1
+	}
+
+	index = max(0, min(index, len(tl.queue)-offset)) + offset
+	tl.queue = slices.Insert(tl.queue, index, track)
+}
+
+// ReplaceUpcoming replaces everything that plays after the current track (the
+// user queue and the rest of the context) with the tracks in uris, in that
+// order. Tracks up to and including the current one are kept, as is the
+// current queue item if one is playing. Entries that were already upcoming keep
+// their uid and metadata; new ones get a fresh uid. The list is no longer
+// considered shuffled afterwards, because the order is now explicit.
+func (tl *List) ReplaceUpcoming(ctx context.Context, uris []string) error {
+	if tl.tracks.pos < 0 {
+		return fmt.Errorf("no current track")
+	}
+
+	// Load every remaining page first: the paged list fetches the page after
+	// the last item's page, so the new tail must sit on the last real page.
+	iter := tl.tracks.iterHere()
+	for iter.next(ctx) {
+	}
+	if err := iter.error(); err != nil {
+		return fmt.Errorf("failed loading context before replacing upcoming tracks: %w", err)
+	}
+
+	// Pool the currently upcoming tracks by uri so reordered entries are reused.
+	pool := map[string][]*connectpb.ContextTrack{}
+	addToPool := func(t *connectpb.ContextTrack) {
+		if t == nil {
+			return
+		}
+		uri := t.Uri
+		if uri == "" && len(t.Gid) > 0 {
+			uri = librespot.SpotifyIdFromGid(tl.ctx.Type(), t.Gid).Uri()
+		}
+		pool[uri] = append(pool[uri], t)
+	}
+	queue := tl.queue
+	if tl.playingQueue && len(queue) > 0 {
+		queue = queue[1:]
+	}
+	for _, t := range queue {
+		addToPool(t)
+	}
+	for _, it := range tl.tracks.list[tl.tracks.pos+1:] {
+		addToPool(it.item)
+	}
+
+	last := tl.tracks.list[len(tl.tracks.list)-1]
+	tl.tracks.list = tl.tracks.list[:tl.tracks.pos+1]
+	for i, uri := range uris {
+		var track *connectpb.ContextTrack
+		if cands := pool[uri]; len(cands) > 0 {
+			track, pool[uri] = cands[0], cands[1:]
+			if track.Uri == "" {
+				track.Uri = uri
+			}
+		} else {
+			replaceUidSeq++
+			track = &connectpb.ContextTrack{Uri: uri, Uid: fmt.Sprintf("r%d", replaceUidSeq)}
+		}
+		if track.Metadata == nil {
+			track.Metadata = map[string]string{}
+		}
+		delete(track.Metadata, "is_queued")
+
+		tl.tracks.list = append(tl.tracks.list, pagedListItem[*connectpb.ContextTrack]{
+			item:    track,
+			pageIdx: last.pageIdx,
+			itemIdx: last.itemIdx + 1 + i,
+		})
+	}
+
+	if tl.playingQueue && len(tl.queue) > 0 {
+		tl.queue = tl.queue[:1]
+	} else {
+		tl.queue = nil
+	}
+
+	tl.shuffled = false
+	tl.shuffleSeed = 0
+	return nil
+}
+
+var replaceUidSeq uint64

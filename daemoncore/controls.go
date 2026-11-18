@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -197,6 +198,7 @@ func (p *AppPlayer) handlePlayerEvent(ctx context.Context, ev *player.Event) {
 		hasNextTrack, err := p.advanceNext(context.TODO(), false, false)
 		if err != nil {
 			p.app.log.WithError(err).Error("failed advancing to next track")
+			p.emitError("advance", err)
 		}
 
 		// if no track to be played, just stop
@@ -225,6 +227,11 @@ func (p *AppPlayer) handlePlayerEvent(ctx context.Context, ev *player.Event) {
 type skipToFunc func(*connectpb.ContextTrack) bool
 
 func (p *AppPlayer) loadContext(ctx context.Context, spotCtx *connectpb.Context, skipTo skipToFunc, paused, drop bool) error {
+	return p.loadContextAt(ctx, spotCtx, skipTo, paused, drop, 0)
+}
+
+// loadContextAt is loadContext starting the selected track at positionMs.
+func (p *AppPlayer) loadContextAt(ctx context.Context, spotCtx *connectpb.Context, skipTo skipToFunc, paused, drop bool, positionMs int64) error {
 	ctxTracks, err := tracks.NewTrackListFromContext(ctx, p.app.log, p.sess.Spclient(), spotCtx)
 	if err != nil {
 		return fmt.Errorf("failed creating track list: %w", err)
@@ -261,7 +268,7 @@ func (p *AppPlayer) loadContext(ctx context.Context, spotCtx *connectpb.Context,
 	}
 
 	p.state.player.Timestamp = time.Now().UnixMilli()
-	p.state.player.PositionAsOfTimestamp = 0
+	p.state.player.PositionAsOfTimestamp = max(0, positionMs)
 
 	if skipTo == nil {
 		// if shuffle is enabled, we'll start from a random track
@@ -345,11 +352,15 @@ func (p *AppPlayer) loadCurrentTrack(ctx context.Context, paused, drop bool) err
 		var err error
 		p.primaryStream, err = p.player.NewStream(ctx, p.app.client, *spotId, p.app.cfg.Bitrate, trackPosition)
 		if err != nil {
+			p.primaryStream = nil
+			p.loadFailed(ctx)
 			return fmt.Errorf("failed creating stream for %s: %w", spotId, err)
 		}
 	}
 
 	if err := p.player.SetPrimaryStream(p.primaryStream.Source, paused, drop); err != nil {
+		p.primaryStream = nil
+		p.loadFailed(ctx)
 		return fmt.Errorf("failed setting stream for %s: %w", spotId, err)
 	}
 
@@ -463,9 +474,25 @@ func (p *AppPlayer) setQueue(ctx context.Context, prev []*connectpb.ContextTrack
 	p.schedulePrefetchNext()
 }
 
+// loadFailed leaves the player in a consistent state after the current track
+// could not be loaded: the track stays selected (so play retries it), paused,
+// not buffering, and without the previous track's duration.
+func (p *AppPlayer) loadFailed(ctx context.Context) {
+	p.state.updateTimestamp()
+	p.state.player.IsBuffering = false
+	p.state.player.Duration = 0
+	p.state.player.PlaybackId = ""
+	p.state.setPaused(true)
+	p.updateState(ctx)
+}
+
 func (p *AppPlayer) play(ctx context.Context) error {
 	if p.primaryStream == nil {
-		return fmt.Errorf("no primary stream")
+		// The last load failed (e.g. a network error): retry it.
+		if p.state.player.Track == nil || p.state.player.Track.Uri == "" {
+			return fmt.Errorf("no primary stream")
+		}
+		return p.loadCurrentTrack(ctx, false, true)
 	}
 
 	// seek before play to ensure we are at the correct stream position
@@ -493,6 +520,9 @@ func (p *AppPlayer) play(ctx context.Context) error {
 
 func (p *AppPlayer) pause(ctx context.Context) error {
 	if p.primaryStream == nil {
+		if p.state.player.IsPaused {
+			return nil // e.g. after a failed load: already paused
+		}
 		return fmt.Errorf("no primary stream")
 	}
 
@@ -814,15 +844,8 @@ type DeviceInfo struct {
 	Name           string
 	Type           string
 	IsActive       bool
-	Volume         int  // 0-100 percent
+	Volume         int // 0-100 percent
 	SupportsVolume bool
-}
-
-// QueueInfo holds a snapshot of the playback queue.
-type QueueInfo struct {
-	Current *TrackSummary
-	Prev    []TrackSummary
-	Next    []TrackSummary
 }
 
 // listDevicesFromCluster returns all Spotify Connect devices from the cached
@@ -838,6 +861,10 @@ func (p *AppPlayer) listDevicesFromCluster() []DeviceInfo {
 		devices := make([]DeviceInfo, 0, len(cluster.Device))
 		for id, info := range cluster.Device {
 			vol := int(info.GetVolume()) * 100 / player.MaxStateVolume
+			if p.state.device != nil && id == p.state.device.DeviceId {
+				// The cluster's copy of our own volume can be stale.
+				vol = int(p.state.device.Volume) * 100 / player.MaxStateVolume
+			}
 			devices = append(devices, DeviceInfo{
 				Id:             id,
 				Name:           info.GetName(),
@@ -847,6 +874,13 @@ func (p *AppPlayer) listDevicesFromCluster() []DeviceInfo {
 				SupportsVolume: info.GetCapabilities() != nil && !info.GetCapabilities().GetDisableVolume(),
 			})
 		}
+		// Stable order for pickers: active device first, then by name.
+		sort.Slice(devices, func(i, j int) bool {
+			if devices[i].IsActive != devices[j].IsActive {
+				return devices[i].IsActive
+			}
+			return devices[i].Name < devices[j].Name
+		})
 		return devices
 	}
 

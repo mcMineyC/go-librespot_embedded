@@ -36,8 +36,8 @@ type Decoder struct {
 	SampleRate int32
 	Channels   int32
 
-	// meta is the associated metadata (for seeking)
-	meta *MetadataPage
+	// meta maps seek positions to byte offsets in input
+	meta SeekIndex
 
 	// gain is the default track gain.
 	gain float32
@@ -93,7 +93,10 @@ type Info struct {
 }
 
 // New creates and initialises a new OggVorbis decoder for the provided bytestream.
-func New(log librespot.Logger, r librespot.SizedReadAtSeeker, meta *MetadataPage, gain float32) (*Decoder, error) {
+// meta maps seek positions to input offsets: Spotify's *MetadataPage, or a
+// *GranuleSeeker for standard Ogg files. If r implements io.Closer, Close
+// closes it.
+func New(log librespot.Logger, r librespot.SizedReadAtSeeker, meta SeekIndex, gain float32) (*Decoder, error) {
 	d := &Decoder{
 		log:      log,
 		input:    r,
@@ -134,6 +137,9 @@ func (d *Decoder) Close() {
 	}
 	d.closed = true
 	d.decoderStateCleanup()
+	if c, ok := d.input.(io.Closer); ok {
+		_ = c.Close()
+	}
 }
 
 func (d *Decoder) decoderStateCleanup() {
@@ -369,7 +375,10 @@ func (d *Decoder) SetPositionMs(pos int64) (err error) {
 
 	// get the seek position in bytes from the milliseconds
 	posSamples := pos * int64(d.SampleRate) / 1000
-	posBytes := d.meta.GetSeekPosition(posSamples)
+	posBytes, err := d.meta.SeekOffset(posSamples)
+	if err != nil {
+		return fmt.Errorf("failed finding seek position: %w", err)
+	}
 	if posBytes > d.input.Size() {
 		posBytes = d.input.Size()
 	}

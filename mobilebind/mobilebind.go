@@ -8,13 +8,24 @@ import (
 	"fmt"
 	"strings"
 	"sync"
+	"time"
 
 	// Use the new stable core package extracted from cmd/daemon.
 	daemon "github.com/devgianlu/go-librespot/daemoncore"
+	"github.com/sirupsen/logrus"
 )
 
 type EventCallback interface {
-	// event: e.g. "playing", "paused", "metadata", "active", "inactive", "stopped", etc
+	// event: e.g. "playing", "paused", "metadata", "active", "inactive", "stopped", etc.
+	// Also:
+	//   "queue_changed" {"context_uri","uri","next_count"} — the context, current
+	//                   track or upcoming tracks changed; call GetQueueJSON.
+	//   "error"         {"source","message","uri"} — a playback operation failed
+	//                   in the background (e.g. source "advance", "skip_next",
+	//                   "load_context", "connect_command").
+	//   "online" / "offline" — the connection to Spotify was (re)established
+	//                   or lost; playback commands from other devices pause
+	//                   while offline.
 	// payloadJson: raw JSON payload from ApiEvent.Data
 	OnEvent(event string, payloadJson string)
 	// optional error/status channel to app
@@ -46,6 +57,10 @@ type CredentialCallback interface {
 }
 
 type Librespot struct {
+	// mu guards the lifecycle fields below. It is held only to read or swap
+	// them, never across a playback or network call: player state is
+	// serialised on the player's own loop, and network calls (metadata,
+	// search, library) can run in parallel.
 	mu     sync.Mutex
 	ctx    context.Context
 	cancel context.CancelFunc
@@ -54,9 +69,71 @@ type Librespot struct {
 	app    *daemon.App
 	player *daemon.AppPlayer
 
+	cbMu         sync.RWMutex
 	cb           EventCallback
 	credentialCb CredentialCallback
+	oggCb        OggDumpCallback
 	started      bool
+
+	// Automatic Ogg dump settings (see oggdump.go), guarded by mu. They are
+	// kept across restarts and applied to the app on start.
+	oggDir     string
+	oggEnabled bool
+
+	// pausedForBackground is set when OnBackground paused playback, so
+	// OnForeground resumes only what it paused.
+	pausedForBackground bool
+}
+
+// handles returns the running app and player without holding the lock for
+// the duration of the caller's work.
+func (l *Librespot) handles() (*daemon.App, *daemon.AppPlayer, error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.app == nil || l.player == nil {
+		return nil, nil, fmt.Errorf("not started")
+	}
+	return l.app, l.player, nil
+}
+
+func (l *Librespot) playerHandle() (*daemon.AppPlayer, error) {
+	_, p, err := l.handles()
+	return p, err
+}
+
+func (l *Librespot) eventCallback() EventCallback {
+	l.cbMu.RLock()
+	defer l.cbMu.RUnlock()
+	return l.cb
+}
+
+func (l *Librespot) setEventCallback(cb EventCallback) {
+	l.cbMu.Lock()
+	l.cb = cb
+	l.cbMu.Unlock()
+}
+
+// networkTimeout bounds bridge calls that talk to Spotify's servers.
+const networkTimeout = 2 * time.Minute
+
+func networkCtx() (context.Context, context.CancelFunc) {
+	return context.WithTimeout(context.Background(), networkTimeout)
+}
+
+func marshalJSON(v any) (string, error) {
+	b, err := json.Marshal(v)
+	if err != nil {
+		return "", fmt.Errorf("failed to marshal response: %w", err)
+	}
+	return string(b), nil
+}
+
+func parseURIList(urisJson string) ([]string, error) {
+	var uris []string
+	if err := json.Unmarshal([]byte(urisJson), &uris); err != nil {
+		return nil, fmt.Errorf("expected a JSON array of uri strings: %w", err)
+	}
+	return uris, nil
 }
 
 // DeviceInfo describes a Spotify Connect device from the cached cluster
@@ -128,12 +205,13 @@ func (l *Librespot) SetCredentialCallback(cb CredentialCallback) {
 }
 
 func (l *Librespot) SetEventCallback(cb EventCallback) {
-	l.mu.Lock()
-	defer l.mu.Unlock()
-	l.cb = cb
+	l.setEventCallback(cb)
 
-	// If app is already running, wire the callback to it
-	if l.app != nil {
+	l.mu.Lock()
+	running := l.app != nil
+	l.mu.Unlock()
+	if running {
+		l.routeLogs(logrus.GetLevel())
 		l.dispatchLog("info", "event callback registered")
 	}
 }
@@ -146,11 +224,20 @@ func (l *Librespot) StartWithConfigJSON(configJSON string, cb EventCallback) err
 	if l.started {
 		return fmt.Errorf("already started")
 	}
-	l.cb = cb
+	l.setEventCallback(cb)
 
 	cfg, err := daemon.ParseConfigJSON(configJSON)
 	if err != nil {
 		return fmt.Errorf("invalid config json: %w", err)
+	}
+	oggCfg, err := parseOggDumpConfig(configJSON)
+	if err != nil {
+		return fmt.Errorf("invalid config json: %w", err)
+	}
+	// An "ogg_dump" object in the config overrides EnableOggDump calls made
+	// before start; without one, those calls are kept.
+	if oggCfg.Dir != "" || oggCfg.Enabled {
+		l.oggDir, l.oggEnabled = oggCfg.Dir, oggCfg.Enabled
 	}
 
 	// Normalize/validate mobile defaults
@@ -180,6 +267,7 @@ func (l *Librespot) StartWithConfigJSON(configJSON string, cb EventCallback) err
 	if err != nil {
 		return err
 	}
+	l.routeLogs(cfg.LogLevel)
 
 	player, err := app.NewAppPlayer(context.Background())
 	if err != nil {
@@ -191,6 +279,11 @@ func (l *Librespot) StartWithConfigJSON(configJSON string, cb EventCallback) err
 	l.doneCh = make(chan struct{})
 	l.app = app
 	l.player = player
+
+	if err := l.applyOggDumpLocked(); err != nil {
+		l.oggEnabled = false
+		l.dispatchLog("warn", fmt.Sprintf("ogg dump disabled: %v", err))
+	}
 
 	go l.runEventPump()
 	go func() {
@@ -226,23 +319,27 @@ func (l *Librespot) StartWithConfigJSON(configJSON string, cb EventCallback) err
 // BeginInteractiveAuth starts an OAuth flow and returns the URL for the host
 // to open. Call CompleteInteractiveAuth with the redirect URL when done.
 func (l *Librespot) BeginInteractiveAuth() (string, error) {
-	l.mu.Lock()
-	defer l.mu.Unlock()
-	if l.app == nil {
+	app := l.appHandle()
+	if app == nil {
 		return "", fmt.Errorf("not started")
 	}
-	return l.app.BeginInteractiveAuth(context.Background())
+	return app.BeginInteractiveAuth(context.Background())
+}
+
+func (l *Librespot) appHandle() *daemon.App {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.app
 }
 
 // CompleteInteractiveAuth consumes the redirect URL (or raw auth code) after
 // the user completes the OAuth flow in a browser/Custom Tab.
 func (l *Librespot) CompleteInteractiveAuth(callbackURL string) error {
-	l.mu.Lock()
-	defer l.mu.Unlock()
-	if l.app == nil {
+	app := l.appHandle()
+	if app == nil {
 		return fmt.Errorf("not started")
 	}
-	_, err := l.app.CompleteInteractiveAuthAndReturnCredentials(context.Background(), callbackURL)
+	_, err := app.CompleteInteractiveAuthAndReturnCredentials(context.Background(), callbackURL)
 	return err
 }
 
@@ -279,24 +376,48 @@ func (l *Librespot) LoadStateJSON(stateJson string) error {
 // Lifecycle
 // ---------------------------------------------------------------------------
 
-// OnBackground pauses playback when the host app moves to the background.
+// OnBackground pauses playback when the host app moves to the background. It
+// does nothing if playback is already paused or stopped.
 func (l *Librespot) OnBackground() error {
-	l.mu.Lock()
-	defer l.mu.Unlock()
-	if l.player == nil {
+	p, err := l.playerHandle()
+	if err != nil {
 		return nil
 	}
-	return l.player.ApiPause()
+	if st := p.ApiGetStatus(); st == nil || !st.Playing {
+		return nil
+	}
+	if err := p.ApiPause(); err != nil {
+		return err
+	}
+	l.mu.Lock()
+	l.pausedForBackground = true
+	l.mu.Unlock()
+	return nil
 }
 
-// OnForeground resumes playback when the host app returns to the foreground.
+// clearBackgroundPause forgets a pause made by OnBackground, so an explicit
+// play or pause (e.g. from lock-screen controls) is not undone by OnForeground.
+func (l *Librespot) clearBackgroundPause() {
+	l.mu.Lock()
+	l.pausedForBackground = false
+	l.mu.Unlock()
+}
+
+// OnForeground resumes playback when the host app returns to the foreground,
+// but only if OnBackground paused it: playback the user paused stays paused.
 func (l *Librespot) OnForeground() error {
 	l.mu.Lock()
-	defer l.mu.Unlock()
-	if l.player == nil {
+	resume := l.pausedForBackground
+	l.pausedForBackground = false
+	l.mu.Unlock()
+	if !resume {
 		return nil
 	}
-	return l.player.ApiPlay()
+	p, err := l.playerHandle()
+	if err != nil {
+		return nil
+	}
+	return p.ApiPlay()
 }
 
 // Stop shuts down the player and all background goroutines.
@@ -319,70 +440,66 @@ func (l *Librespot) Stop() error {
 
 // Play resumes playback.
 func (l *Librespot) Play() error {
-	l.mu.Lock()
-	defer l.mu.Unlock()
-	if l.player == nil {
-		return fmt.Errorf("not started")
+	p, err := l.playerHandle()
+	if err != nil {
+		return err
 	}
-	return l.player.ApiPlay()
+	l.clearBackgroundPause()
+	return p.ApiPlay()
 }
 
 // Pause pauses playback.
 func (l *Librespot) Pause() error {
-	l.mu.Lock()
-	defer l.mu.Unlock()
-	if l.player == nil {
-		return fmt.Errorf("not started")
+	p, err := l.playerHandle()
+	if err != nil {
+		return err
 	}
-	return l.player.ApiPause()
+	l.clearBackgroundPause()
+	return p.ApiPause()
 }
 
 // Next advances to the next track.
 func (l *Librespot) Next() error {
-	l.mu.Lock()
-	defer l.mu.Unlock()
-	if l.player == nil {
-		return fmt.Errorf("not started")
+	p, err := l.playerHandle()
+	if err != nil {
+		return err
 	}
-	return l.player.ApiNext("")
+	return p.ApiNext("")
 }
 
 // Previous goes back to the previous track (or seeks to the start if past 3s).
 func (l *Librespot) Previous() error {
-	l.mu.Lock()
-	defer l.mu.Unlock()
-	if l.player == nil {
-		return fmt.Errorf("not started")
+	p, err := l.playerHandle()
+	if err != nil {
+		return err
 	}
-	return l.player.ApiPrev()
+	return p.ApiPrev()
 }
 
 // SkipToNextTrack skips forward to the track with the given Spotify URI within
 // the current context. The URI must appear in the next-tracks list.
 func (l *Librespot) SkipToNextTrack(uri string) error {
-	l.mu.Lock()
-	defer l.mu.Unlock()
-	if l.player == nil {
-		return fmt.Errorf("not started")
+	p, err := l.playerHandle()
+	if err != nil {
+		return err
 	}
 	if uri == "" {
 		return fmt.Errorf("uri must not be empty")
 	}
-	return l.player.ApiNext(uri)
+	return p.ApiNext(uri)
 }
 
 // SkipToPrevTrack skips backward to the track with the given Spotify URI.
 // The URI must appear in the prev-tracks list.
 func (l *Librespot) SkipToPrevTrack(uri string) error {
-	l.mu.Lock()
-	defer l.mu.Unlock()
-	if l.player == nil {
-		return fmt.Errorf("not started")
+	p, err := l.playerHandle()
+	if err != nil {
+		return err
 	}
 	if uri == "" {
 		return fmt.Errorf("uri must not be empty")
 	}
-	return l.player.ApiPrevTo(uri)
+	return p.ApiPrevTo(uri)
 }
 
 // ---------------------------------------------------------------------------
@@ -391,111 +508,101 @@ func (l *Librespot) SkipToPrevTrack(uri string) error {
 
 // ApiSeek seeks the current track to positionMs (milliseconds from start).
 func (l *Librespot) ApiSeek(positionMs int64) error {
-	l.mu.Lock()
-	defer l.mu.Unlock()
-	if l.player == nil {
-		return fmt.Errorf("not started")
+	p, err := l.playerHandle()
+	if err != nil {
+		return err
 	}
-	return l.player.ApiSeek(positionMs)
+	return p.ApiSeek(positionMs)
 }
 
 // ApiSetRepeat sets repeat mode: off | context | track.
 func (l *Librespot) ApiSetRepeat(mode string) error {
-	l.mu.Lock()
-	defer l.mu.Unlock()
-	if l.player == nil {
-		return fmt.Errorf("not started")
+	p, err := l.playerHandle()
+	if err != nil {
+		return err
 	}
-	return l.player.ApiSetRepeat(mode)
+	return p.ApiSetRepeat(mode)
 }
 
 // ApiSetShuffle enables or disables shuffle for the current context.
 func (l *Librespot) ApiSetShuffle(enabled bool) error {
-	l.mu.Lock()
-	defer l.mu.Unlock()
-	if l.player == nil {
-		return fmt.Errorf("not started")
+	p, err := l.playerHandle()
+	if err != nil {
+		return err
 	}
-	return l.player.ApiSetShuffle(enabled)
+	return p.ApiSetShuffle(enabled)
 }
 
 // ApiSetVolume sets volume to vol steps (0..VolumeSteps from config).
 func (l *Librespot) ApiSetVolume(vol int32) error {
-	l.mu.Lock()
-	defer l.mu.Unlock()
-	if l.player == nil {
-		return fmt.Errorf("not started")
+	p, err := l.playerHandle()
+	if err != nil {
+		return err
 	}
-	return l.player.ApiSetVolume(vol)
+	return p.ApiSetVolume(vol)
 }
 
 // ApiGetVolume returns the current volume step and configured maximum.
 func (l *Librespot) ApiGetVolume() (value uint32, max uint32) {
-	l.mu.Lock()
-	defer l.mu.Unlock()
-	if l.player == nil {
+	p, err := l.playerHandle()
+	if err != nil {
 		return 0, 0
 	}
-	return l.player.ApiGetVolume()
+	return p.ApiGetVolume()
 }
 
 // ApiPlayUri loads a Spotify context URI; skipToUri and paused as in daemoncore.
 func (l *Librespot) ApiPlayUri(uri, skipToUri string, paused bool) error {
-	l.mu.Lock()
-	defer l.mu.Unlock()
-	if l.player == nil {
-		return fmt.Errorf("not started")
+	p, err := l.playerHandle()
+	if err != nil {
+		return err
 	}
 	if uri == "" {
 		return fmt.Errorf("uri must not be empty")
 	}
-	return l.player.ApiPlayUri(uri, skipToUri, paused)
+	return p.ApiPlayUri(uri, skipToUri, paused)
 }
 
 // ApiAddToQueue appends a track or episode URI to the play-ahead queue.
 func (l *Librespot) ApiAddToQueue(uri string) error {
-	l.mu.Lock()
-	defer l.mu.Unlock()
-	if l.player == nil {
-		return fmt.Errorf("not started")
+	p, err := l.playerHandle()
+	if err != nil {
+		return err
 	}
 	if uri == "" {
 		return fmt.Errorf("uri must not be empty")
 	}
-	return l.player.ApiAddToQueue(uri)
+	return p.ApiAddToQueue(uri)
 }
 
 // ApiRemoveFromQueue removes the first matching URI from the next queue.
 func (l *Librespot) ApiRemoveFromQueue(uri string) error {
-	l.mu.Lock()
-	defer l.mu.Unlock()
-	if l.player == nil {
-		return fmt.Errorf("not started")
+	p, err := l.playerHandle()
+	if err != nil {
+		return err
 	}
 	if uri == "" {
 		return fmt.Errorf("uri must not be empty")
 	}
-	return l.player.ApiRemoveFromQueue(uri)
+	return p.ApiRemoveFromQueue(uri)
 }
 
 // ApiGetQueue returns a snapshot of current, previous, and next tracks.
 func (l *Librespot) ApiGetQueue() *QueueInfo {
-	l.mu.Lock()
-	defer l.mu.Unlock()
-	if l.player == nil {
+	p, err := l.playerHandle()
+	if err != nil {
 		return &QueueInfo{Prev: []TrackInfo{}, Next: []TrackInfo{}}
 	}
-	return queueInfoFromDaemon(l.player.ApiGetQueue())
+	return queueInfoFromDaemon(p.ApiGetQueue())
 }
 
 // ApiClearQueueCtx clears user-queued items using ctx.
 func (l *Librespot) ApiClearQueueCtx(ctx context.Context) {
-	l.mu.Lock()
-	defer l.mu.Unlock()
-	if l.player == nil {
+	p, err := l.playerHandle()
+	if err != nil {
 		return
 	}
-	l.player.ApiClearQueue(ctx)
+	p.ApiClearQueue(ctx)
 }
 
 // ApiClearQueue uses a background context.
@@ -505,12 +612,11 @@ func (l *Librespot) ApiClearQueue() {
 
 // ApiListDevices returns visible Connect devices from the cached cluster.
 func (l *Librespot) ApiListDevices() []DeviceInfo {
-	l.mu.Lock()
-	defer l.mu.Unlock()
-	if l.player == nil {
+	p, err := l.playerHandle()
+	if err != nil {
 		return nil
 	}
-	raw := l.player.ApiListDevices()
+	raw := p.ApiListDevices()
 	out := make([]DeviceInfo, len(raw))
 	for i := range raw {
 		out[i] = deviceInfoFromDaemon(raw[i])
@@ -521,13 +627,12 @@ func (l *Librespot) ApiListDevices() []DeviceInfo {
 // ApiGetMetadataForURI resolves metadata for a Spotify URI and returns it as JSON.
 // The response shape depends on URI type (track/album/artist/playlist).
 func (l *Librespot) ApiGetMetadataForURI(uri string) (string, error) {
-	l.mu.Lock()
-	defer l.mu.Unlock()
-	if l.app == nil || l.player == nil {
-		return "", fmt.Errorf("not started")
+	app, p, err := l.handles()
+	if err != nil {
+		return "", err
 	}
 
-	meta, err := l.app.GetMetadataForURI(context.Background(), l.player, uri)
+	meta, err := app.GetMetadataForURI(context.Background(), p, uri)
 	if err != nil {
 		return "", err
 	}
@@ -543,13 +648,12 @@ func (l *Librespot) ApiGetMetadataForURI(uri string) (string, error) {
 // ApiGetRootPlaylist fetches the authenticated user's root playlist (library root)
 // and returns it as JSON.
 func (l *Librespot) ApiGetRootPlaylist() (string, error) {
-	l.mu.Lock()
-	defer l.mu.Unlock()
-	if l.app == nil || l.player == nil {
-		return "", fmt.Errorf("not started")
+	app, p, err := l.handles()
+	if err != nil {
+		return "", err
 	}
 
-	root, err := l.app.GetRootPlaylist(context.Background(), l.player)
+	root, err := app.GetRootPlaylist(context.Background(), p)
 	if err != nil {
 		return "", err
 	}
@@ -580,6 +684,13 @@ type RootLibraryItem struct {
 	Description string `json:"description"`
 	ImageURL    string `json:"image_url,omitempty"`
 	Kind        string `json:"kind"`
+	// Revision (hex) changes whenever a playlist changes; compare it with the
+	// value from the last sync to skip unchanged playlists.
+	Revision string `json:"revision,omitempty"`
+	Length   int    `json:"length,omitempty"`
+	// Folder is the uri of the folder containing this item (empty at the top
+	// level). Folders are items with kind "folder"; they cannot be played.
+	Folder string `json:"folder,omitempty"`
 }
 
 func rootLibraryKindFromURI(uri string) string {
@@ -603,13 +714,12 @@ func rootLibraryKindFromURI(uri string) string {
 
 // ApiGetRootLibraryItems fetches authenticated user rootlist and returns compact JSON.
 func (l *Librespot) ApiGetRootLibraryItems() (string, error) {
-	l.mu.Lock()
-	defer l.mu.Unlock()
-	if l.app == nil || l.player == nil {
-		return "", fmt.Errorf("not started")
+	app, p, err := l.handles()
+	if err != nil {
+		return "", err
 	}
 
-	libraryItems, err := l.app.GetRootLibraryItems(context.Background(), l.player)
+	libraryItems, err := app.GetRootLibraryItems(context.Background(), p)
 	if err != nil {
 		return "", err
 	}
@@ -631,6 +741,9 @@ func (l *Librespot) ApiGetRootLibraryItems() (string, error) {
 			Description: it.Description,
 			ImageURL:    it.ImageURL,
 			Kind:        rootLibraryKindFromURI(it.URI),
+			Revision:    it.Revision,
+			Length:      it.Length,
+			Folder:      it.Folder,
 		})
 	}
 
@@ -654,20 +767,23 @@ func (l *Librespot) GetRootLibraryItemsJSON() string {
 // ApiSearch performs a Spotify search and returns compact JSON results:
 //
 //	[
-//	  {"spotify_id":"...","title":"...","description":"..."},
+//	  {"spotify_id":"...","title":"...","description":"...",
+//	   "kind":"track","image_url":"...","duration_ms":215000},
 //	  ...
 //	]
+//
+// "kind" is the URI type (track, album, artist, playlist, show, episode, ...).
+// "image_url" and "duration_ms" are omitted when not applicable.
 func (l *Librespot) ApiSearch(query string, limit int) (string, error) {
-	l.mu.Lock()
-	defer l.mu.Unlock()
-	if l.app == nil || l.player == nil {
-		return "", fmt.Errorf("not started")
+	app, p, err := l.handles()
+	if err != nil {
+		return "", err
 	}
 	query = strings.TrimSpace(query)
 	if query == "" {
 		return "", fmt.Errorf("query must not be empty")
 	}
-	return l.app.Search(context.Background(), l.player, query, limit)
+	return app.Search(context.Background(), p, query, limit)
 }
 
 // Search is a convenience wrapper around ApiSearch.
@@ -687,16 +803,15 @@ func (l *Librespot) Search(query string, limit int) string {
 //	  ...
 //	]
 func (l *Librespot) ApiSearchSuggestions(query string, limit int) (string, error) {
-	l.mu.Lock()
-	defer l.mu.Unlock()
-	if l.app == nil || l.player == nil {
-		return "", fmt.Errorf("not started")
+	app, p, err := l.handles()
+	if err != nil {
+		return "", err
 	}
 	query = strings.TrimSpace(query)
 	if query == "" {
 		return "", fmt.Errorf("query must not be empty")
 	}
-	return l.app.SearchSuggestions(context.Background(), l.player, query, limit)
+	return app.SearchSuggestions(context.Background(), p, query, limit)
 }
 
 // SearchSuggestions is a convenience wrapper around ApiSearchSuggestions.
@@ -716,12 +831,11 @@ func (l *Librespot) SearchSuggestions(query string, limit int) string {
 //	  ...
 //	]
 func (l *Librespot) ApiRecentSearches(limit int) (string, error) {
-	l.mu.Lock()
-	defer l.mu.Unlock()
-	if l.app == nil || l.player == nil {
-		return "", fmt.Errorf("not started")
+	app, p, err := l.handles()
+	if err != nil {
+		return "", err
 	}
-	return l.app.RecentSearches(context.Background(), l.player, limit)
+	return app.RecentSearches(context.Background(), p, limit)
 }
 
 // RecentSearches is a convenience wrapper around ApiRecentSearches.
@@ -736,15 +850,14 @@ func (l *Librespot) RecentSearches(limit int) string {
 
 // ApiTransferPlaybackCtx moves playback to deviceId using ctx.
 func (l *Librespot) ApiTransferPlaybackCtx(ctx context.Context, deviceId string, play bool) error {
-	l.mu.Lock()
-	defer l.mu.Unlock()
-	if l.player == nil {
-		return fmt.Errorf("not started")
+	p, err := l.playerHandle()
+	if err != nil {
+		return err
 	}
 	if deviceId == "" {
 		return fmt.Errorf("deviceId must not be empty")
 	}
-	return l.player.ApiTransferPlayback(ctx, deviceId, play)
+	return p.ApiTransferPlayback(ctx, deviceId, play)
 }
 
 // ApiTransferPlayback uses a background context.
@@ -788,12 +901,11 @@ func (l *Librespot) SetVolume(vol int32) error {
 // where "value" is the current volume step and "max" is the configured
 // VolumeSteps ceiling. Returns an empty JSON object if not started.
 func (l *Librespot) GetVolumeJSON() string {
-	l.mu.Lock()
-	defer l.mu.Unlock()
-	if l.player == nil {
+	p, err := l.playerHandle()
+	if err != nil {
 		return "{}"
 	}
-	value, max := l.player.ApiGetVolume()
+	value, max := p.ApiGetVolume()
 	b, _ := json.Marshal(struct {
 		Value uint32 `json:"value"`
 		Max   uint32 `json:"max"`
@@ -828,51 +940,38 @@ func (l *Librespot) RemoveFromQueue(uri string) error {
 	return l.ApiRemoveFromQueue(uri)
 }
 
-// GetQueueJSON returns a JSON snapshot of the current playback queue:
+// GetQueueJSON returns a JSON snapshot of the current playback queue with
+// display metadata for every entry:
 //
 //	{
-//	  "current": {"uri": "spotify:track:...", "name": "Track Name"},
-//	  "prev":    [{"uri": "...", "name": "..."}, ...],
-//	  "next":    [{"uri": "...", "name": "..."}, ...]
+//	  "context_uri": "spotify:playlist:...",
+//	  "current": {
+//	    "uri": "spotify:track:...", "uid": "...", "provider": "context",
+//	    "name": "Track Name", "duration_ms": 215000, "isrc": "...",
+//	    "explicit": false, "has_lyrics": true,
+//	    "album": {"uri": "...", "name": "...", "image_url": "...", "thumbnail_url": "..."},
+//	    "artists": [{"uri": "...", "name": "..."}]
+//	  },
+//	  "prev": [...],
+//	  "next": [...]
 //	}
 //
 // "current" is null when nothing is playing. "prev" is oldest-first.
-// Returns "{}" if not started.
+// "provider" is "context", "queue" (user-queued) or "autoplay".
+// Metadata comes from one batched, cached request; if it cannot be fetched,
+// entries still carry uri, uid, provider and name. Returns "{}" if not started.
 func (l *Librespot) GetQueueJSON() string {
-	l.mu.Lock()
-	if l.player == nil {
-		l.mu.Unlock()
+	p, err := l.playerHandle()
+	if err != nil {
 		return "{}"
 	}
-	q := queueInfoFromDaemon(l.player.ApiGetQueue())
-	l.mu.Unlock()
-
-	type trackJSON struct {
-		URI  string `json:"uri"`
-		Name string `json:"name"`
+	ctx, cancel := networkCtx()
+	defer cancel()
+	out, err := marshalJSON(p.GetDetailedQueue(ctx))
+	if err != nil {
+		return "{}"
 	}
-	type queueJSON struct {
-		Current *trackJSON  `json:"current"`
-		Prev    []trackJSON `json:"prev"`
-		Next    []trackJSON `json:"next"`
-	}
-
-	out := queueJSON{
-		Prev: []trackJSON{},
-		Next: []trackJSON{},
-	}
-	if q.Current != nil {
-		out.Current = &trackJSON{URI: q.Current.URI, Name: q.Current.Name}
-	}
-	for _, t := range q.Prev {
-		out.Prev = append(out.Prev, trackJSON{URI: t.URI, Name: t.Name})
-	}
-	for _, t := range q.Next {
-		out.Next = append(out.Next, trackJSON{URI: t.URI, Name: t.Name})
-	}
-
-	b, _ := json.Marshal(out)
-	return string(b)
+	return out
 }
 
 // ClearQueue is equivalent to ApiClearQueue.
@@ -898,13 +997,12 @@ type TrackInfo struct {
 //
 // Each entry has "uri" and "name" fields. "prev" is oldest-first.
 func (l *Librespot) ContextTracksJSON(n int) string {
-	l.mu.Lock()
-	defer l.mu.Unlock()
-	if l.player == nil {
+	p, err := l.playerHandle()
+	if err != nil {
 		return `{"prev":[],"next":[]}`
 	}
 
-	rawPrev, rawNext := l.player.SurroundingTracks(n)
+	rawPrev, rawNext := p.SurroundingTracks(n)
 
 	type trackJSON struct {
 		URI  string `json:"uri"`
@@ -936,12 +1034,11 @@ func (l *Librespot) ContextTracksJSON(n int) string {
 // Deprecated: prefer ContextTracksJSON which is gomobile-safe. This method
 // returns Go slice types and may not bind correctly on all platforms.
 func (l *Librespot) ContextTracks(n int) (prev []TrackInfo, next []TrackInfo) {
-	l.mu.Lock()
-	defer l.mu.Unlock()
-	if l.player == nil {
+	p, err := l.playerHandle()
+	if err != nil {
 		return nil, nil
 	}
-	rawPrev, rawNext := l.player.SurroundingTracks(n)
+	rawPrev, rawNext := p.SurroundingTracks(n)
 	for _, t := range rawPrev {
 		prev = append(prev, TrackInfo{URI: t.URI, Name: t.Name})
 	}
@@ -1025,13 +1122,13 @@ func (l *Librespot) runEventPump() {
 }
 
 func (l *Librespot) dispatchState(event, payload string) {
-	if l.cb != nil {
-		l.cb.OnEvent(event, payload)
+	if cb := l.eventCallback(); cb != nil {
+		cb.OnEvent(event, payload)
 	}
 }
 
 func (l *Librespot) dispatchLog(level, msg string) {
-	if l.cb != nil {
-		l.cb.OnLog(level, msg)
+	if cb := l.eventCallback(); cb != nil {
+		cb.OnLog(level, msg)
 	}
 }

@@ -94,6 +94,8 @@ type App struct {
 	logoutCh chan *AppPlayer
 
 	credentialPersistCb CredentialPersistCallback
+
+	oggDump oggDumper
 }
 
 func parseDeviceType(val string) (devicespb.DeviceType, error) {
@@ -314,6 +316,9 @@ type SearchResultItem struct {
 	SpotifyID   string `json:"spotify_id"`
 	Title       string `json:"title"`
 	Description string `json:"description,omitempty"`
+	Kind        string `json:"kind,omitempty"`
+	ImageURL    string `json:"image_url,omitempty"`
+	DurationMs  int64  `json:"duration_ms,omitempty"`
 }
 
 // SearchSuggestion is a compact suggestion payload returned by SearchSuggestions.
@@ -337,6 +342,14 @@ type RootLibraryItem struct {
 	Title       string `json:"title"`
 	Description string `json:"description,omitempty"`
 	ImageURL    string `json:"image_url,omitempty"`
+	// Revision (hex) and Length come from the rootlist decoration for
+	// playlists; a changed revision means the playlist changed.
+	Revision string `json:"revision,omitempty"`
+	Length   int    `json:"length,omitempty"`
+	// Folder is the uri (spotify:folder:<id>) of the innermost folder that
+	// contains this item, or empty at the top level. Folders themselves are
+	// items with a spotify:folder: uri.
+	Folder string `json:"folder,omitempty"`
 }
 
 type rootLibraryMetadata struct {
@@ -835,7 +848,7 @@ func extractPathfinderDescription(ent map[string]any) string {
 		return ""
 	}
 
-	if s := strings.TrimSpace(stringFromAny(ent["description"])); s != "" {
+	if s := cleanDescription(stringFromAny(ent["description"])); s != "" {
 		return s
 	}
 	if s := extractPathfinderArtists(ent); s != "" {
@@ -859,6 +872,83 @@ func extractPathfinderDescription(ent map[string]any) string {
 	}
 
 	return ""
+}
+
+// extractPathfinderImage returns the cover/avatar URL closest to 300px from a
+// Pathfinder entity, looking in the places tracks, albums, artists,
+// playlists, podcasts and episodes keep it.
+func extractPathfinderImage(ent map[string]any) string {
+	if ent == nil {
+		return ""
+	}
+	var sources []any
+	for _, path := range [][]string{
+		{"albumOfTrack", "coverArt", "sources"},
+		{"coverArt", "sources"},
+		{"visuals", "avatarImage", "sources"},
+		{"avatar", "sources"},
+	} {
+		if sources = pathLookupSlice(ent, path...); len(sources) > 0 {
+			break
+		}
+	}
+	if len(sources) == 0 {
+		if imgs := pathLookupSlice(ent, "images", "items"); len(imgs) > 0 {
+			sources = asSlice(asMap(imgs[0])["sources"])
+		}
+	}
+
+	best, bestDist := "", -1
+	for _, raw := range sources {
+		src := asMap(raw)
+		u := strings.TrimSpace(stringFromAny(src["url"]))
+		if u == "" {
+			continue
+		}
+		w, _ := src["width"].(float64)
+		dist := int(w) - 300
+		if dist < 0 {
+			dist = -dist
+		}
+		if w == 0 {
+			dist = 10000
+		}
+		if bestDist < 0 || dist < bestDist {
+			best, bestDist = u, dist
+		}
+	}
+	return best
+}
+
+func extractPathfinderDuration(ent map[string]any) int64 {
+	for _, key := range []string{"duration", "trackDuration"} {
+		if m := asMap(ent[key]); m != nil {
+			if v, ok := m["totalMilliseconds"].(float64); ok {
+				return int64(v)
+			}
+		}
+	}
+	return 0
+}
+
+func searchKindFromURI(uri string) string {
+	parts := strings.Split(uri, ":")
+	if len(parts) >= 3 && parts[0] == "spotify" {
+		if parts[1] == "user" && len(parts) >= 4 {
+			return parts[len(parts)-2]
+		}
+		return parts[1]
+	}
+	return ""
+}
+
+// recentSearchKind returns the same lowercase kind search results use
+// ("track", "playlist", ...), from the uri when possible.
+func recentSearchKind(id string, ent map[string]any) string {
+	if k := searchKindFromURI(id); k != "" {
+		return k
+	}
+	return strings.ToLower(extractPathfinderKind(ent))
 }
 
 func extractPathfinderKind(ent map[string]any) string {
@@ -966,7 +1056,7 @@ func (app *App) searchFromMercury(ctx context.Context, p *AppPlayer, query strin
 				continue
 			}
 
-			description := strings.TrimSpace(stringFromAny(item["description"]))
+			description := cleanDescription(stringFromAny(item["description"]))
 			if description == "" {
 				description = extractArtistsSummary(item)
 			}
@@ -1014,7 +1104,7 @@ outer:
 			}
 			seen[key] = struct{}{}
 
-			description := strings.TrimSpace(stringFromAny(item["description"]))
+			description := cleanDescription(stringFromAny(item["description"]))
 			if description == "" {
 				description = extractArtistsSummary(item)
 			}
@@ -1109,6 +1199,9 @@ func (app *App) Search(ctx context.Context, p *AppPlayer, query string, limit in
 					SpotifyID:   id,
 					Title:       title,
 					Description: extractPathfinderDescription(ent),
+					Kind:        searchKindFromURI(id),
+					ImageURL:    extractPathfinderImage(ent),
+					DurationMs:  extractPathfinderDuration(ent),
 				})
 			}
 
@@ -1260,7 +1353,7 @@ func (app *App) RecentSearches(ctx context.Context, p *AppPlayer, limit int) (st
 			Title:       title,
 			SpotifyID:   id,
 			Description: extractPathfinderDescription(ent),
-			Kind:        extractPathfinderKind(ent),
+			Kind:        recentSearchKind(id, ent),
 		})
 
 		if len(out) >= limit {
@@ -1392,12 +1485,35 @@ func (app *App) GetRootLibraryItems(ctx context.Context, p *AppPlayer) ([]RootLi
 	missingURIs := make([]string, 0, len(items))
 	seenMissing := make(map[string]struct{}, len(items))
 
+	var folders []string // stack of open folder uris
+	currentFolder := func() string {
+		if len(folders) == 0 {
+			return ""
+		}
+		return folders[len(folders)-1]
+	}
+
 	for i, it := range items {
 		if it == nil {
 			continue
 		}
 		uri := it.GetUri()
 		if uri == "" {
+			continue
+		}
+
+		// Folders are encoded as spotify:start-group:<id>:<name> ...
+		// spotify:end-group:<id> markers around their contents.
+		if id, name, ok := parseRootlistGroupStart(uri); ok {
+			folderURI := "spotify:folder:" + id
+			out = append(out, RootLibraryItem{URI: folderURI, Title: name, Folder: currentFolder()})
+			folders = append(folders, folderURI)
+			continue
+		}
+		if strings.HasPrefix(uri, "spotify:end-group:") {
+			if len(folders) > 0 {
+				folders = folders[:len(folders)-1]
+			}
 			continue
 		}
 
@@ -1420,6 +1536,12 @@ func (app *App) GetRootLibraryItems(ctx context.Context, p *AppPlayer) ([]RootLi
 			URI:         uri,
 			Title:       title,
 			Description: desc,
+			Folder:      currentFolder(),
+		}
+
+		if len(metaItems) == len(items) && metaItems[i] != nil {
+			entry.Revision = hex.EncodeToString(metaItems[i].GetRevision())
+			entry.Length = int(metaItems[i].GetLength())
 		}
 
 		if attrs != nil {
@@ -1504,7 +1626,7 @@ func (app *App) GetRootLibraryItems(ctx context.Context, p *AppPlayer) ([]RootLi
 		if len(sample) > 15 {
 			sample = sample[:15]
 		}
-		app.log.Warnf("library metadata pipeline: unresolved after batch=%d kinds=%v sample=%v", len(unresolvedBeforeFallback), unresolvedKindsBefore, sample)
+		app.log.Debugf("library metadata pipeline: unresolved after batch=%d kinds=%v sample=%v", len(unresolvedBeforeFallback), unresolvedKindsBefore, sample)
 	}
 
 	for i := range out {
@@ -1564,7 +1686,25 @@ func (app *App) GetRootLibraryItems(ctx context.Context, p *AppPlayer) ([]RootLi
 
 	app.log.Debugf("library metadata pipeline: total took %s", time.Since(totalStart))
 
+	for i := range out {
+		out[i].Description = cleanDescription(out[i].Description)
+	}
 	return out, nil
+}
+
+// parseRootlistGroupStart parses a spotify:start-group:<id>:<url-encoded name>
+// rootlist marker.
+func parseRootlistGroupStart(uri string) (id, name string, ok bool) {
+	rest, ok := strings.CutPrefix(uri, "spotify:start-group:")
+	if !ok {
+		return "", "", false
+	}
+	id, rawName, _ := strings.Cut(rest, ":")
+	name, err := url.QueryUnescape(rawName)
+	if err != nil {
+		name = rawName
+	}
+	return id, name, id != ""
 }
 
 func normalizeRootlistMetaURIHint(v string) string {
@@ -1844,7 +1984,7 @@ func (app *App) getBatchedRootLibraryMetadata(ctx context.Context, p *AppPlayer,
 
 	app.log.Debugf("library metadata pipeline: extended metadata diagnostics kinds=%v statuses=%v", kindCounts, statusCounts)
 	if len(samples) > 0 {
-		app.log.Warnf("library metadata pipeline: extended metadata sample=%v", samples)
+		app.log.Debugf("library metadata pipeline: extended metadata sample=%v", samples)
 	}
 
 	return out, nil
@@ -2028,12 +2168,13 @@ func (app *App) newAppPlayer(ctx context.Context, creds any) (_ *AppPlayer, err 
 		logout:       app.logoutCh,
 		countryCode:  new(string),
 		volumeUpdate: make(chan float32, 1),
+		calls:        make(chan playerCall),
+		runDone:      make(chan struct{}),
 	}
 
 	appPlayer.prefetchTimer = time.NewTimer(math.MaxInt64)
 	appPlayer.prefetchTimer.Stop()
 
-	fmt.Printf("Creds type: %T\n", creds)
 	if appPlayer.sess, err = session.NewSessionFromOptions(ctx, &session.Options{
 		Log:         app.log,
 		DeviceType:  app.deviceType,
@@ -2080,6 +2221,7 @@ func (app *App) newAppPlayer(ctx context.Context, creds any) (_ *AppPlayer, err 
 	); err != nil {
 		return nil, fmt.Errorf("failed initializing player: %w", err)
 	}
+	appPlayer.player.SetOggStore(&app.oggDump)
 
 	return appPlayer, nil
 }

@@ -80,6 +80,7 @@ const (
 	ApiRequestTypeSearch              ApiRequestType = "search"
 	ApiRequestTypeSearchSuggestions   ApiRequestType = "search_suggestions"
 	ApiRequestTypeRecentSearches      ApiRequestType = "recent_searches"
+	ApiRequestTypeLibrary             ApiRequestType = "library"
 )
 
 type ApiEventType string
@@ -98,6 +99,10 @@ const (
 	ApiEventTypeRepeatTrack    ApiEventType = "repeat_track"
 	ApiEventTypeRepeatContext  ApiEventType = "repeat_context"
 	ApiEventTypeShuffleContext ApiEventType = "shuffle_context"
+	ApiEventTypeQueueChanged   ApiEventType = "queue_changed"
+	ApiEventTypeError          ApiEventType = "error"
+	ApiEventTypeOnline         ApiEventType = "online"
+	ApiEventTypeOffline        ApiEventType = "offline"
 )
 
 type ApiRequest struct {
@@ -339,6 +344,19 @@ type ApiEventDataRepeatContext struct {
 
 type ApiEventDataShuffleContext struct {
 	Value bool `json:"value"`
+}
+
+type ApiEventDataQueueChanged struct {
+	ContextUri string `json:"context_uri"`
+	Uri        string `json:"uri"`
+	NextCount  int    `json:"next_count"`
+}
+
+type ApiEventDataError struct {
+	// Source names the operation that failed, e.g. "advance", "skip_next", "load_context".
+	Source  string `json:"source"`
+	Message string `json:"message"`
+	Uri     string `json:"uri,omitempty"`
 }
 
 func NewApiServer(log librespot.Logger, address string, port int, allowOrigin string, certFile string, keyFile string) (_ ApiServer, err error) {
@@ -705,6 +723,66 @@ func (s *ConcreteApiServer) serve() {
 			Type: ApiRequestTypeRecentSearches,
 			Data: ApiRequestDataSearch{Limit: limit},
 		}, w)
+	})
+	m.HandleFunc("/library", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != "GET" {
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			return
+		}
+
+		s.handleRequest(ApiRequest{Type: ApiRequestTypeLibrary}, w)
+	})
+	m.HandleFunc("/devices", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != "GET" {
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			return
+		}
+
+		s.handleRequest(ApiRequest{Type: ApiRequestTypeListDevices}, w)
+	})
+	m.HandleFunc("/player/transfer", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != "POST" {
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			return
+		}
+
+		var data ApiRequestDataTransferPlayback
+		if err := jsonDecode(r, &data); err != nil {
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		if len(data.DeviceId) == 0 {
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+
+		s.handleRequest(ApiRequest{Type: ApiRequestTypeTransferPlayback, Data: data}, w)
+	})
+	m.HandleFunc("/player/queue", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != "GET" {
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			return
+		}
+
+		s.handleRequest(ApiRequest{Type: ApiRequestTypeGetQueue}, w)
+	})
+	m.HandleFunc("/player/remove_from_queue", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != "POST" {
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			return
+		}
+
+		var data ApiRequestDataRemoveFromQueue
+		if err := jsonDecode(r, &data); err != nil {
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		if len(data.Uri) == 0 {
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+
+		s.handleRequest(ApiRequest{Type: ApiRequestTypeRemoveFromQueue, Data: data}, w)
 	})
 	m.HandleFunc("/events", func(w http.ResponseWriter, r *http.Request) {
 		opts := &websocket.AcceptOptions{}

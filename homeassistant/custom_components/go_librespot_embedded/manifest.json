@@ -1,0 +1,12 @@
+{
+  "domain": "go_librespot_embedded",
+  "name": "Go Librespot (Embedded Fork)",
+  "version": "0.1.0",
+  "documentation": "https://github.com/devgianlu/go-librespot",
+  "issue_tracker": "https://github.com/devgianlu/go-librespot/issues",
+  "codeowners": [],
+  "config_flow": true,
+  "iot_class": "local_push",
+  "requirements": [],
+  "dependencies": []
+}

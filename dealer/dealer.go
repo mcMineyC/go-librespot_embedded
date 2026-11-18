@@ -45,6 +45,26 @@ type Dealer struct {
 
 	requestReceivers     map[string]requestReceiver
 	requestReceiversLock sync.RWMutex
+
+	connStateCb     func(online bool)
+	connStateCbLock sync.RWMutex
+}
+
+// SetConnectionStateCallback registers cb to be called with false when the
+// dealer connection drops and with true once it has been re-established.
+func (d *Dealer) SetConnectionStateCallback(cb func(online bool)) {
+	d.connStateCbLock.Lock()
+	d.connStateCb = cb
+	d.connStateCbLock.Unlock()
+}
+
+func (d *Dealer) notifyConnectionState(online bool) {
+	d.connStateCbLock.RLock()
+	cb := d.connStateCb
+	d.connStateCbLock.RUnlock()
+	if cb != nil {
+		cb(online)
+	}
 }
 
 func NewDealer(log librespot.Logger, client *http.Client, dealerAddr librespot.GetAddressFunc, accessToken librespot.GetLogin5TokenFunc) *Dealer {
@@ -233,6 +253,8 @@ loop:
 
 	// if we shouldn't stop, try to reconnect
 	if !d.stop {
+		d.notifyConnectionState(false)
+
 		d.connMu.Lock()
 		if err := backoff.Retry(d.reconnect, backoff.NewExponentialBackOff()); err != nil {
 			d.log.WithError(err).Errorf("failed reconnecting dealer")
@@ -296,5 +318,6 @@ func (d *Dealer) reconnect() error {
 	go d.recvLoop()
 
 	d.log.Debugf("re-established dealer connection")
+	d.notifyConnectionState(true)
 	return nil
 }

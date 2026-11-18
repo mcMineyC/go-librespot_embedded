@@ -161,6 +161,7 @@ func (p *AppPlayer) updateState(ctx context.Context) {
 	if err := p.putConnectState(ctx, connectpb.PutStateReason_PLAYER_STATE_CHANGED); err != nil {
 		p.app.log.WithError(err).Error("failed put state after update")
 	}
+	p.maybeEmitQueueChanged()
 }
 
 func (p *AppPlayer) putConnectState(ctx context.Context, reason connectpb.PutStateReason) error {

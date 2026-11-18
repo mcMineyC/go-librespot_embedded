@@ -205,3 +205,35 @@ func (m MetadataPage) GetSeekPosition(samplesPos int64) int64 {
 
 	return int64(bytesPos)
 }
+
+// ReplayGain holds the ReplayGain values Spotify embeds in its metadata page.
+// Gains are in dB, peaks are linear amplitudes (1.0 = full scale).
+type ReplayGain struct {
+	TrackGainDb float32 `json:"track_gain_db"`
+	TrackPeak   float32 `json:"track_peak"`
+	AlbumGainDb float32 `json:"album_gain_db"`
+	AlbumPeak   float32 `json:"album_peak"`
+}
+
+// ReplayGain returns the ReplayGain values from the metadata page, if present.
+func (m *MetadataPage) ReplayGain() (ReplayGain, bool) {
+	if m == nil || !m.hasReplayGain {
+		return ReplayGain{}, false
+	}
+	return ReplayGain{
+		TrackGainDb: m.trackGainDb,
+		TrackPeak:   m.trackPeak,
+		AlbumGainDb: m.albumGainDb,
+		AlbumPeak:   m.albumPeak,
+	}, true
+}
+
+// Comments returns the standard REPLAYGAIN_* Vorbis comments for these values.
+func (rg ReplayGain) Comments() []string {
+	return []string{
+		fmt.Sprintf("REPLAYGAIN_TRACK_GAIN=%.2f dB", rg.TrackGainDb),
+		fmt.Sprintf("REPLAYGAIN_TRACK_PEAK=%.6f", rg.TrackPeak),
+		fmt.Sprintf("REPLAYGAIN_ALBUM_GAIN=%.2f dB", rg.AlbumGainDb),
+		fmt.Sprintf("REPLAYGAIN_ALBUM_PEAK=%.6f", rg.AlbumPeak),
+	}
+}

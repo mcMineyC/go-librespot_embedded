@@ -13,6 +13,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/devgianlu/go-librespot/mpris"
@@ -55,6 +56,17 @@ type AppPlayer struct {
 	// local one. Protected by clusterLock.
 	cluster     *connectpb.Cluster
 	clusterLock sync.RWMutex
+
+	// calls carries functions from the bridge into the Run loop so they are
+	// serialised with Connect commands and player events. See exec.
+	calls       chan playerCall
+	running     atomic.Bool
+	runDone     chan struct{}
+	runDoneOnce sync.Once
+
+	// lastQueueKey is the queue fingerprint last announced with a
+	// queue_changed event. Only touched from the Run loop.
+	lastQueueKey string
 }
 
 func (p *AppPlayer) handleAccesspointPacket(pktType ap.PacketType, payload []byte) error {
@@ -453,18 +465,14 @@ func (p *AppPlayer) handleApiRequest(ctx context.Context, req ApiRequest) (any, 
 
 		return resp, nil
 	case ApiRequestTypeResume:
-		_ = p.play(ctx)
-		return nil, nil
+		return nil, p.play(ctx)
 	case ApiRequestTypePause:
-		_ = p.pause(ctx)
-		return nil, nil
+		return nil, p.pause(ctx)
 	case ApiRequestTypePlayPause:
 		if p.state.player.IsPaused {
-			_ = p.play(ctx)
-		} else {
-			_ = p.pause(ctx)
+			return nil, p.play(ctx)
 		}
-		return nil, nil
+		return nil, p.pause(ctx)
 	case ApiRequestTypeSeek:
 		data := req.Data.(ApiRequestDataSeek)
 
@@ -478,20 +486,28 @@ func (p *AppPlayer) handleApiRequest(ctx context.Context, req ApiRequest) (any, 
 		_ = p.seek(ctx, position)
 		return nil, nil
 	case ApiRequestTypePrev:
-		_ = p.skipPrev(ctx, true)
+		if err := p.skipPrev(ctx, true); err != nil {
+			p.emitError("skip_prev", err)
+		}
 		return nil, nil
 	case ApiRequestTypePrevTo:
 		data := req.Data.(ApiRequestDataNext)
 		if data.Uri != nil && *data.Uri != "" {
-			_ = p.skipPrevTo(ctx, *data.Uri)
+			if err := p.skipPrevTo(ctx, *data.Uri); err != nil {
+				p.emitError("skip_prev", err)
+			}
 		}
 		return nil, nil
 	case ApiRequestTypeNext:
 		data := req.Data.(ApiRequestDataNext)
+		var err error
 		if data.Uri != nil {
-			_ = p.skipNext(ctx, &connectpb.ContextTrack{Uri: *data.Uri})
+			err = p.skipNext(ctx, &connectpb.ContextTrack{Uri: *data.Uri})
 		} else {
-			_ = p.skipNext(ctx, nil)
+			err = p.skipNext(ctx, nil)
+		}
+		if err != nil {
+			p.emitError("skip_next", err)
 		}
 		return nil, nil
 	case ApiRequestTypePlay:
@@ -579,12 +595,63 @@ func (p *AppPlayer) handleApiRequest(ctx context.Context, req ApiRequest) (any, 
 		data := req.Data.(ApiRequestDataTransferPlayback)
 		return nil, p.transferPlayback(ctx, data.DeviceId, data.Play)
 	case ApiRequestTypeGetQueue:
-		return p.ApiGetQueue(), nil
+		return p.getQueue(), nil
 	case ApiRequestTypeRemoveFromQueue:
 		data := req.Data.(ApiRequestDataRemoveFromQueue)
-		return nil, p.ApiRemoveFromQueue(data.Uri)
+		return nil, p.removeFromQueue(ctx, data.Uri)
 	case ApiRequestTypeListDevices:
-		return p.ApiListDevices(), nil
+		return p.listDevices(), nil
+	case ApiRequestTypeLibrary:
+		items, err := p.app.GetRootLibraryItems(ctx, p)
+		if err != nil {
+			return nil, fmt.Errorf("failed getting library items: %w", err)
+		}
+
+		type libraryItemResponse struct {
+			Uri         string `json:"uri"`
+			Name        string `json:"name"`
+			Description string `json:"description"`
+			ImageUrl    string `json:"image_url,omitempty"`
+			Kind        string `json:"kind"`
+		}
+
+		kindFromUri := func(uri string) string {
+			switch {
+			case strings.HasPrefix(uri, "spotify:playlist:"):
+				return "playlist"
+			case strings.HasPrefix(uri, "spotify:folder:"):
+				return "folder"
+			case strings.HasPrefix(uri, "spotify:show:"):
+				return "show"
+			case strings.HasPrefix(uri, "spotify:album:"):
+				return "album"
+			case strings.HasPrefix(uri, "spotify:artist:"):
+				return "artist"
+			case strings.HasPrefix(uri, "spotify:user:"):
+				return "collection"
+			default:
+				return "unknown"
+			}
+		}
+
+		out := make([]libraryItemResponse, 0, len(items))
+		for _, it := range items {
+			if it.URI == "" {
+				continue
+			}
+			name := it.Title
+			if name == "" {
+				name = it.URI
+			}
+			out = append(out, libraryItemResponse{
+				Uri:         it.URI,
+				Name:        name,
+				Description: it.Description,
+				ImageUrl:    it.ImageURL,
+				Kind:        kindFromUri(it.URI),
+			})
+		}
+		return out, nil
 	case ApiRequestTypeSearch:
 		data := req.Data.(ApiRequestDataSearch)
 		raw, err := p.app.Search(ctx, p, data.Query, data.Limit)
@@ -710,12 +777,25 @@ func (p *AppPlayer) Close() {
 }
 
 func (p *AppPlayer) Run(ctx context.Context, apiRecv <-chan ApiRequest, mprisRecv <-chan mpris.MediaPlayer2PlayerCommand) {
+	defer p.markRunDone()
+
 	err := p.sess.Dealer().Connect(ctx)
 	if err != nil {
 		p.app.log.WithError(err).Error("failed connecting to dealer")
+		p.app.server.Emit(&ApiEvent{Type: ApiEventTypeOffline})
 		p.Close()
 		return
 	}
+
+	p.sess.Dealer().SetConnectionStateCallback(func(online bool) {
+		if online {
+			p.app.server.Emit(&ApiEvent{Type: ApiEventTypeOnline})
+		} else {
+			p.app.server.Emit(&ApiEvent{Type: ApiEventTypeOffline})
+		}
+	})
+	p.app.server.Emit(&ApiEvent{Type: ApiEventTypeOnline})
+	p.running.Store(true)
 
 	apRecv := p.sess.Accesspoint().Receive(ap.PacketTypeProductInfo, ap.PacketTypeCountryCode)
 	msgRecv := p.sess.Dealer().ReceiveMessage("hm://pusher/v1/connections/", "hm://connect-state/v1/")
@@ -729,6 +809,10 @@ func (p *AppPlayer) Run(ctx context.Context, apiRecv <-chan ApiRequest, mprisRec
 		select {
 		case <-p.stop:
 			return
+		case <-ctx.Done():
+			return
+		case c := <-p.calls:
+			p.runCall(ctx, c)
 		case pkt, ok := <-apRecv:
 			if !ok {
 				continue
@@ -752,6 +836,7 @@ func (p *AppPlayer) Run(ctx context.Context, apiRecv <-chan ApiRequest, mprisRec
 
 			if err := p.handleDealerRequest(ctx, req); err != nil {
 				p.app.log.WithError(err).Warn("failed handling dealer request")
+				p.emitError("connect_command", err)
 				req.Reply(false)
 			} else {
 				p.app.log.Debugf("sending successful reply for dealer request")
@@ -801,253 +886,4 @@ func (p *AppPlayer) Run(ctx context.Context, apiRecv <-chan ApiRequest, mprisRec
 			p.volumeUpdated(ctx)
 		}
 	}
-}
-
-func (p *AppPlayer) ApiPlay() error {
-	_, err := p.handleApiRequest(context.Background(), ApiRequest{Type: ApiRequestTypeResume})
-	return err
-}
-
-func (p *AppPlayer) ApiPause() error {
-	_, err := p.handleApiRequest(context.Background(), ApiRequest{Type: ApiRequestTypePause})
-	return err
-}
-
-func (p *AppPlayer) ApiNext(uri string) error {
-	var data ApiRequestDataNext
-	if uri != "" {
-		data.Uri = &uri
-	}
-	_, err := p.handleApiRequest(context.Background(), ApiRequest{
-		Type: ApiRequestTypeNext,
-		Data: data,
-	})
-	return err
-}
-
-func (p *AppPlayer) ApiPrev() error {
-	_, err := p.handleApiRequest(context.Background(), ApiRequest{Type: ApiRequestTypePrev})
-	return err
-}
-
-func (p *AppPlayer) ApiPrevTo(uri string) error {
-	if uri == "" {
-		return p.ApiPrev()
-	}
-	_, err := p.handleApiRequest(context.Background(), ApiRequest{
-		Type: ApiRequestTypePrevTo,
-		Data: ApiRequestDataNext{Uri: &uri},
-	})
-	return err
-}
-
-// ApiSeek seeks the current track to positionMs milliseconds from the start.
-func (p *AppPlayer) ApiSeek(positionMs int64) error {
-	_, err := p.handleApiRequest(context.Background(), ApiRequest{
-		Type: ApiRequestTypeSeek,
-		Data: ApiRequestDataSeek{Position: positionMs, Relative: false},
-	})
-	return err
-}
-
-// ApiSetRepeat sets the repeat mode. Accepted values:
-//   - "off"     — no repeat
-//   - "context" — repeat the current playlist/album
-//   - "track"   — repeat the current track
-//
-// Sends the two boolean connect-state commands (set_repeating_context +
-// set_repeating_track) that the Spotify protocol uses, mirroring spotcontrol.
-func (p *AppPlayer) ApiSetRepeat(mode string) error {
-	ctx := context.Background()
-	var wantContext, wantTrack bool
-	switch mode {
-	case "off":
-		wantContext, wantTrack = false, false
-	case "context":
-		wantContext, wantTrack = true, false
-	case "track":
-		wantContext, wantTrack = true, true
-	default:
-		return fmt.Errorf("invalid repeat mode %q: must be off, context, or track", mode)
-	}
-	if _, err := p.handleApiRequest(ctx, ApiRequest{
-		Type: ApiRequestTypeSetRepeatingContext,
-		Data: wantContext,
-	}); err != nil {
-		return err
-	}
-	_, err := p.handleApiRequest(ctx, ApiRequest{
-		Type: ApiRequestTypeSetRepeatingTrack,
-		Data: wantTrack,
-	})
-	return err
-}
-
-// ApiSetShuffle enables or disables shuffle.
-func (p *AppPlayer) ApiSetShuffle(enabled bool) error {
-	_, err := p.handleApiRequest(context.Background(), ApiRequest{
-		Type: ApiRequestTypeSetShufflingContext,
-		Data: enabled,
-	})
-	return err
-}
-
-// ApiSetVolume sets the volume to vol steps out of p.app.cfg.VolumeSteps.
-// This matches the semantics of the REST API: pass 0..VolumeSteps.
-func (p *AppPlayer) ApiSetVolume(vol int32) error {
-	_, err := p.handleApiRequest(context.Background(), ApiRequest{
-		Type: ApiRequestTypeSetVolume,
-		Data: ApiRequestDataVolume{Volume: vol, Relative: false},
-	})
-	return err
-}
-
-// ApiGetVolume returns the current volume (0..VolumeSteps) and the VolumeSteps max.
-func (p *AppPlayer) ApiGetVolume() (value uint32, max uint32) {
-	return p.apiVolume(), p.app.cfg.VolumeSteps
-}
-
-// ApiPlayUri resolves and loads a Spotify context URI (playlist, album, artist,
-// track, episode, show, collection). skipToUri, if non-empty, skips within the
-// context to that track URI. paused controls whether playback starts paused.
-func (p *AppPlayer) ApiPlayUri(uri, skipToUri string, paused bool) error {
-	_, err := p.handleApiRequest(context.Background(), ApiRequest{
-		Type: ApiRequestTypePlay,
-		Data: ApiRequestDataPlay{Uri: uri, SkipToUri: skipToUri, Paused: paused},
-	})
-	return err
-}
-
-// ApiAddToQueue appends a Spotify track or episode URI to the playback queue.
-func (p *AppPlayer) ApiAddToQueue(uri string) error {
-	_, err := p.handleApiRequest(context.Background(), ApiRequest{
-		Type: ApiRequestTypeAddToQueue,
-		Data: uri,
-	})
-	return err
-}
-
-// ApiRemoveFromQueue removes the first occurrence of the given URI from the
-// play-ahead (next) queue and updates the player state. It does not affect the
-// current track or the history (prev) tracks.
-func (p *AppPlayer) ApiRemoveFromQueue(uri string) error {
-	ctx := context.Background()
-	if p.state == nil || p.state.tracks == nil {
-		return fmt.Errorf("no active context")
-	}
-
-	next := p.state.player.NextTracks
-	filtered := make([]*connectpb.ContextTrack, 0, len(next))
-	removed := false
-	for _, t := range next {
-		if !removed && t.Uri == uri {
-			removed = true
-			continue
-		}
-		filtered = append(filtered, librespot.ProvidedTrackToContextTrack(t))
-	}
-	if !removed {
-		return fmt.Errorf("uri %q not found in queue", uri)
-	}
-	prevCT := make([]*connectpb.ContextTrack, 0, len(p.state.player.PrevTracks))
-	for _, t := range p.state.player.PrevTracks {
-		prevCT = append(prevCT, librespot.ProvidedTrackToContextTrack(t))
-	}
-	p.setQueue(ctx, prevCT, filtered)
-	return nil
-}
-
-// ApiGetQueue returns the current playback queue as QueueInfo.
-func (p *AppPlayer) ApiGetQueue() *QueueInfo {
-	if p.state == nil || p.state.player == nil {
-		return &QueueInfo{}
-	}
-
-	var current *TrackSummary
-	if p.state.player.Track != nil {
-		current = &TrackSummary{
-			URI:  p.state.player.Track.Uri,
-			Name: p.state.player.Track.Metadata["title"],
-		}
-	}
-
-	prev := make([]TrackSummary, 0, len(p.state.player.PrevTracks))
-	for _, t := range p.state.player.PrevTracks {
-		prev = append(prev, TrackSummary{URI: t.Uri, Name: t.Metadata["title"]})
-	}
-	next := make([]TrackSummary, 0, len(p.state.player.NextTracks))
-	for _, t := range p.state.player.NextTracks {
-		next = append(next, TrackSummary{URI: t.Uri, Name: t.Metadata["title"]})
-	}
-
-	return &QueueInfo{
-		Current: current,
-		Prev:    prev,
-		Next:    next,
-	}
-}
-
-// ApiClearQueue removes all user-queued tracks from the next-tracks list,
-// keeping only context tracks.
-func (p *AppPlayer) ApiClearQueue(ctx context.Context) {
-	if p.state == nil || p.state.tracks == nil {
-		return
-	}
-	// Passing empty slices clears the user queue portion via setQueue.
-	prevCT := make([]*connectpb.ContextTrack, 0, len(p.state.player.PrevTracks))
-	for _, t := range p.state.player.PrevTracks {
-		prevCT = append(prevCT, librespot.ProvidedTrackToContextTrack(t))
-	}
-	p.setQueue(ctx, prevCT, []*connectpb.ContextTrack{})
-}
-
-// ApiListDevices returns all Spotify Connect devices visible in the current
-// cluster state. The list is derived from the local cached cluster and
-// requires no network round-trip.
-func (p *AppPlayer) ApiListDevices() []DeviceInfo {
-	if p.state == nil {
-		return nil
-	}
-	return p.listDevicesFromCluster()
-}
-
-// ApiTransferPlayback asks the Spotify backend to move active playback to
-// deviceId. If play is true, playback starts immediately on the target.
-func (p *AppPlayer) ApiTransferPlayback(ctx context.Context, deviceId string, play bool) error {
-	if deviceId == "" {
-		return fmt.Errorf("deviceId must not be empty")
-	}
-	return p.transferPlayback(ctx, deviceId, play)
-}
-
-// TrackSummary is a minimal track description returned by SurroundingTracks.
-type TrackSummary struct {
-	URI  string
-	Name string
-}
-
-// SurroundingTracks returns up to n tracks from PrevTracks and NextTracks on
-// the current player state. prev is ordered oldest-first; next is in play order.
-func (p *AppPlayer) SurroundingTracks(n int) (prev []TrackSummary, next []TrackSummary) {
-	if p.state == nil || p.state.player == nil {
-		return nil, nil
-	}
-
-	// PrevTracks is oldest-first (already reversed in tracks.PrevTracks).
-	rawPrev := p.state.player.PrevTracks
-	if start := len(rawPrev) - n; start > 0 {
-		rawPrev = rawPrev[start:]
-	}
-	for _, t := range rawPrev {
-		prev = append(prev, TrackSummary{URI: t.Uri, Name: t.Metadata["title"]})
-	}
-
-	rawNext := p.state.player.NextTracks
-	if n < len(rawNext) {
-		rawNext = rawNext[:n]
-	}
-	for _, t := range rawNext {
-		next = append(next, TrackSummary{URI: t.Uri, Name: t.Metadata["title"]})
-	}
-	return prev, next
 }

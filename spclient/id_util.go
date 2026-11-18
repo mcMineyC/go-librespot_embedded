@@ -6,7 +6,8 @@ import (
 	"strings"
 )
 
-const base62Alphabet = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
+// Spotify's base62 alphabet: digits, then lowercase, then uppercase.
+const base62Alphabet = "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"
 
 type SpotifyIDType string
 

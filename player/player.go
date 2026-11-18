@@ -3,9 +3,11 @@ package player
 import (
 	"context"
 	"fmt"
+	"io"
 	"math"
 	"net/http"
 	"net/url"
+	"sync"
 	"time"
 
 	librespot "github.com/devgianlu/go-librespot"
@@ -44,6 +46,8 @@ type Player struct {
 	normalisationPregain      float32
 	countryCode               *string
 
+	gain localGain
+
 	sp       *spclient.Spclient
 	audioKey *audio.KeyProvider
 	events   EventManager
@@ -58,6 +62,10 @@ type Player struct {
 	volumeSteps uint32
 
 	startedPlaying time.Time
+
+	oggMu     sync.Mutex
+	oggStore  OggStore
+	oggWrites map[string]*oggWrite
 }
 
 type playerCmdType int
@@ -224,7 +232,7 @@ loop:
 				// create a new output device if needed
 				if out == nil {
 					var err error
-					out, err = p.newOutput(source, volume)
+					out, err = p.newOutput(&gainReader{src: source, gain: &p.gain}, volume)
 					if err != nil {
 						cmd.resp <- err
 						break
@@ -569,6 +577,7 @@ func (p *Player) getUnrestrictedTrack(ctx context.Context, spotId librespot.Spot
 
 func (p *Player) NewStream(ctx context.Context, client *http.Client, spotId librespot.SpotifyId, bitrate int, mediaPosition int64) (*Stream, error) {
 	log := p.log.WithField("uri", spotId.Uri())
+	requestedId := spotId
 
 	playbackId := make([]byte, 16)
 	_, _ = rand.Read(playbackId)
@@ -644,6 +653,75 @@ func (p *Player) NewStream(ctx context.Context, client *http.Client, spotId libr
 
 	log.Debugf("selected format %s (%x)", file.Format.String(), file.FileId)
 
+	if GetAudioFileFormatAudioFormat(*file.Format) != AudioFormatOGGVorbis {
+		return nil, fmt.Errorf("unsupported audio format: %s", *file.Format)
+	}
+
+	// With an Ogg store, playback reads the stored file, downloading it into
+	// the store first if needed; otherwise it streams from Spotify's CDN.
+	var input librespot.SizedReadAtSeeker
+	var seek vorbis.SeekIndex
+	var size int64
+	stored, err := p.openStoredOgg(ctx, log, client, playbackId, requestedId, spotId, media, file)
+	if err != nil {
+		log.WithError(err).Warnf("cannot use stored ogg, streaming instead")
+	} else if stored != nil {
+		input, seek, size = stored, stored.seekIndex(), stored.Size()
+	}
+	if input == nil {
+		ogg, err := p.openSpotifyOgg(ctx, log, client, playbackId, spotId, file)
+		if err != nil {
+			return nil, err
+		}
+		input, seek, size = ogg.audio, ogg.meta, ogg.rawSize
+	}
+
+	vorbisStream, err := vorbis.New(log, input, seek, normalisationFactor)
+	if err != nil {
+		closeQuietly(input)
+		return nil, fmt.Errorf("failed initializing ogg vorbis stream: %w", err)
+	}
+
+	var stream librespot.AudioSource = vorbisStream
+	if vorbisStream.SampleRate != SampleRate {
+		vorbisStream.Close()
+		return nil, fmt.Errorf("unsupported sample rate: %d", vorbisStream.SampleRate)
+	} else if vorbisStream.Channels != Channels {
+		vorbisStream.Close()
+		return nil, fmt.Errorf("unsupported channels: %d", vorbisStream.Channels)
+	}
+
+	// Seek to the correct position if needed.
+	if mediaPosition > 0 {
+		if err := stream.SetPositionMs(max(0, min(mediaPosition, int64(media.Duration())))); err != nil {
+			vorbisStream.Close()
+			return nil, fmt.Errorf("failed seeking stream: %w", err)
+		}
+	}
+
+	return &Stream{PlaybackId: playbackId, Source: stream, Media: media, File: file, Size: size}, nil
+}
+
+// spotifyOgg is a track's audio opened from Spotify's CDN.
+type spotifyOgg struct {
+	// audio is a standard Ogg Vorbis stream: Spotify's metadata page (seek
+	// table + replay gain) has been removed. Reads download on demand and are
+	// cached in memory, so concurrent readers share one download.
+	audio   librespot.SizedReadAtSeeker
+	meta    *vorbis.MetadataPage
+	rawSize int64
+}
+
+func (o *spotifyOgg) replayGain() *vorbis.ReplayGain {
+	if v, ok := o.meta.ReplayGain(); ok {
+		return &v
+	}
+	return nil
+}
+
+// openSpotifyOgg fetches the audio key, resolves storage and opens the
+// decrypted Ogg Vorbis stream for file, which must be an Ogg Vorbis format.
+func (p *Player) openSpotifyOgg(ctx context.Context, log librespot.Logger, client *http.Client, playbackId []byte, spotId librespot.SpotifyId, file *metadatapb.AudioFile) (*spotifyOgg, error) {
 	audioKey, err := p.retrieveAudioKey(ctx, spotId, file.FileId)
 	if err != nil {
 		return nil, fmt.Errorf("failed retrieving audio key: %w", err)
@@ -670,37 +748,103 @@ func (p *Player) NewStream(ctx context.Context, client *http.Client, spotId libr
 		return nil, fmt.Errorf("failed intializing audio decryptor: %w", err)
 	}
 
-	var stream librespot.AudioSource
+	// Spotify prepends a proprietary Ogg page (seek table + replay gain) that is not
+	// part of the Vorbis bitstream; strip it so the result is a standard Ogg Vorbis file.
+	audioStream, meta, err := vorbis.ExtractMetadataPage(p.log, decryptedStream, rawStream.Size())
+	if err != nil {
+		return nil, fmt.Errorf("failed reading metadata page: %w", err)
+	}
 
-	audioFormat := GetAudioFileFormatAudioFormat(*file.Format)
-	if audioFormat == AudioFormatOGGVorbis {
-		audioStream, meta, err := vorbis.ExtractMetadataPage(p.log, decryptedStream, rawStream.Size())
+	return &spotifyOgg{audio: audioStream, meta: meta, rawSize: rawStream.Size()}, nil
+}
+
+func closeQuietly(v any) {
+	if c, ok := v.(io.Closer); ok {
+		_ = c.Close()
+	}
+}
+
+// Same as NewStream but does not decode into raw PCM data
+func (p *Player) NewEncodedStream(ctx context.Context, client *http.Client, spotId librespot.SpotifyId, bitrate int, mediaPosition int64) (*EncodedStream, error) {
+	log := p.log.WithField("uri", spotId.Uri())
+
+	playbackId := make([]byte, 16)
+	_, _ = rand.Read(playbackId)
+
+	p.events.PreStreamLoadNew(playbackId, spotId, mediaPosition)
+
+	var media *librespot.Media
+	var file *metadatapb.AudioFile
+	var trackNorm, albumNorm *audiofilespb.NormalizationParams
+	if spotId.Type() == librespot.SpotifyIdTypeTrack {
+		trackMeta, err := p.getUnrestrictedTrack(ctx, spotId)
 		if err != nil {
-			return nil, fmt.Errorf("failed reading metadata page: %w", err)
+			return nil, err
 		}
 
-		vorbisStream, err := vorbis.New(log, audioStream, meta, normalisationFactor)
+		media = librespot.NewMediaFromTrack(trackMeta)
+		spotId = media.Id()
+
+		var audioFilesResp audiofilespb.AudioFilesExtensionResponse
+		err = p.sp.ExtendedMetadataSimple(ctx, spotId, extmetadatapb.ExtensionKind_AUDIO_FILES, &audioFilesResp)
 		if err != nil {
-			return nil, fmt.Errorf("failed initializing ogg vorbis stream: %w", err)
+			return nil, fmt.Errorf("failed getting audio files metadata: %w", err)
 		}
 
-		if vorbisStream.SampleRate != SampleRate {
-			return nil, fmt.Errorf("unsupported sample rate: %d", vorbisStream.SampleRate)
-		} else if vorbisStream.Channels != Channels {
-			return nil, fmt.Errorf("unsupported channels: %d", vorbisStream.Channels)
+		var audioFiles []*metadatapb.AudioFile
+		for _, f := range audioFilesResp.Files {
+			audioFiles = append(audioFiles, f.File)
 		}
 
-		stream = vorbisStream
+		file = selectBestMediaFormat(audioFiles, bitrate, p.flacEnabled)
+		if file == nil {
+			return nil, librespot.ErrNoSupportedFormats
+		}
+
+		trackNorm = audioFilesResp.DefaultFileNormalizationParams
+		albumNorm = audioFilesResp.DefaultAlbumNormalizationParams
+	} else if spotId.Type() == librespot.SpotifyIdTypeEpisode {
+		var episodeMeta metadatapb.Episode
+		err := p.sp.ExtendedMetadataSimple(ctx, spotId, extmetadatapb.ExtensionKind_EPISODE_V4, &episodeMeta)
+		if err != nil {
+			return nil, fmt.Errorf("failed getting episode metadata: %w", err)
+		}
+
+		media = librespot.NewMediaFromEpisode(&episodeMeta)
+		if isMediaRestricted(media, *p.countryCode) {
+			return nil, librespot.ErrMediaRestricted
+		}
+
+		file = selectBestMediaFormat(episodeMeta.Audio, bitrate, p.flacEnabled)
+		if file == nil {
+			return nil, librespot.ErrNoSupportedFormats
+		}
 	} else {
+		return nil, fmt.Errorf("unsupported spotify type: %s", spotId.Type())
+	}
+
+	p.events.PostStreamResolveAudioFile(playbackId, int32(bitrate), media, file)
+
+	log.Debugf("selected format %s (%x)", file.Format.String(), file.FileId)
+
+	if GetAudioFileFormatAudioFormat(*file.Format) != AudioFormatOGGVorbis {
 		return nil, fmt.Errorf("unsupported audio format: %s", *file.Format)
 	}
 
-	// Seek to the correct position if needed.
-	if mediaPosition > 0 {
-		if err := stream.SetPositionMs(max(0, min(mediaPosition, int64(media.Duration())))); err != nil {
-			return nil, fmt.Errorf("failed seeking stream: %w", err)
-		}
+	ogg, err := p.openSpotifyOgg(ctx, log, client, playbackId, spotId, file)
+	if err != nil {
+		return nil, err
 	}
+	audioStream, rg := ogg.audio, ogg.replayGain()
 
-	return &Stream{PlaybackId: playbackId, Source: stream, Media: media, File: file}, nil
+	return &EncodedStream{
+		PlaybackId:         playbackId,
+		Source:             audioStream,
+		Media:              media,
+		File:               file,
+		Size:               audioStream.Size(),
+		ReplayGain:         rg,
+		TrackNormalization: trackNorm,
+		AlbumNormalization: albumNorm,
+	}, nil
 }
