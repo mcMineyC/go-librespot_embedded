@@ -15,3 +15,8 @@ state.json
 /dist
 .DS_Store
 cuts/
+
+# Local build/test leftovers
+/mobilebind.aar
+/mobilebind-sources.jar
+examples/mobile_host/*.ogg
